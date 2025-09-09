@@ -254,6 +254,7 @@ class App:
         self.cover_kind = "wav" if path.lower().endswith(".wav") else "image"
         self.lbl_cover.config(text=os.path.basename(path))
         self.update_cover_preview()
+        
 
     def choose_payload(self):
         path = filedialog.askopenfilename(title="Choose payload", filetypes=[("All files", "*.*")])
