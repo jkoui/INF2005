@@ -18,7 +18,7 @@
 1. You start with a cover (a normal picture or a sound file).
 This is like a blank notebook where you’ll write your secret.
 
-2. You also have a payload (your secret: could be text, PDF, image, or even a small program 💾).
+2. You also have a payload (your secret: could be text, PDF, image, or even a small program).
 This is what you want to hide.
 
 3. You press Embed →
