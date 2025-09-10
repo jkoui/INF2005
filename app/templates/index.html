@@ -1,0 +1,163 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>ACW1 Stego (Web)</title>
+  <style>
+    body { font-family: system-ui, Arial, sans-serif; margin: 24px; }
+    fieldset { margin-bottom: 24px; }
+    label { display:block; margin-top: 8px; }
+    .row { display:flex; gap:24px; flex-wrap: wrap; }
+    .card { border:1px solid #ddd; border-radius:12px; padding:16px; }
+    .preview img, .preview audio { max-width: 320px; border:1px solid #ccc; border-radius:8px; }
+    .btn { padding:8px 14px; border-radius:8px; border:1px solid #333; background:#111; color:#fff; cursor:pointer;}
+    .btn.secondary { background:#fff; color:#111; }
+    .note { color:#666; font-size: 0.9em; }
+    .flash { background:#ffe9e9; color:#900; padding:10px 12px; border-radius:8px; margin-bottom:16px; border:1px solid #f5b5b5;}
+    table.kv { border-collapse: collapse; }
+    table.kv td { padding:6px 10px; border-bottom:1px dashed #ddd; }
+    table.kv td.key { color:#555; }
+    .muted { color:#666; }
+    h2 { margin-top: 0; }
+  </style>
+</head>
+<body>
+  <h1>ACW1 Stego (Web)</h1>
+  {% with messages = get_flashed_messages() %}
+    {% if messages %}
+      {% for m in messages %}<div class="flash">{{ m }}</div>{% endfor %}
+    {% endif %}
+  {% endwith %}
+
+  <div class="row">
+    <div class="card" style="flex:1; min-width: 340px;">
+      <h2>Embed (Image)</h2>
+      <form action="{{ url_for('embed') }}" method="post" enctype="multipart/form-data">
+        <label>Cover image (PNG/BMP): <input required type="file" name="cover" accept=".png,.bmp,image/png,image/bmp"></label>
+        <label>Payload (any file): <input required type="file" name="payload"></label>
+        <label>LSBs (1–8): <input type="number" name="lsb" min="1" max="8" value="1" required></label>
+        <label>Key (integer): <input type="number" name="key" value="12345" required></label>
+        <button class="btn" type="submit">Embed →</button>
+      </form>
+      <p class="note">Supports images (PNG/BMP).</p>
+    </div>
+
+    <div class="card" style="flex:1; min-width: 340px;">
+      <h2>Extract (Image)</h2>
+      <form action="{{ url_for('extract') }}" method="post" enctype="multipart/form-data">
+        <label>Stego image (PNG/BMP): <input required type="file" name="stego" accept=".png,.bmp,image/png,image/bmp"></label>
+        <label>LSBs (1–8): <input type="number" name="lsb" min="1" max="8" value="1" required></label>
+        <label>Key (integer): <input type="number" name="key" value="12345" required></label>
+        <button class="btn secondary" type="submit">Extract ←</button>
+      </form>
+    </div>
+  </div>
+
+  <div class="row">
+    <div class="card" style="flex:1; min-width: 340px;">
+      <h2>Embed (Audio WAV)</h2>
+      <form action="{{ url_for('embed_audio') }}" method="post" enctype="multipart/form-data">
+        <label>Cover audio (WAV/PCM 8/16-bit): <input required type="file" name="cover_wav" accept=".wav,audio/wav"></label>
+        <label>Payload (any file): <input required type="file" name="payload_wav"></label>
+        <label>LSBs (1–8): <input type="number" name="lsb" min="1" max="8" value="1" required></label>
+        <label>Key (integer): <input type="number" name="key" value="12345" required></label>
+        <button class="btn" type="submit">Embed (WAV) →</button>
+      </form>
+      <p class="note">Only uncompressed PCM WAV is supported.</p>
+    </div>
+
+    <div class="card" style="flex:1; min-width: 340px;">
+      <h2>Extract (Audio WAV)</h2>
+      <form action="{{ url_for('extract_audio') }}" method="post" enctype="multipart/form-data">
+        <label>Stego audio (WAV/PCM): <input required type="file" name="stego_wav" accept=".wav,audio/wav"></label>
+        <label>LSBs (1–8): <input type="number" name="lsb" min="1" max="8" value="1" required></label>
+        <label>Key (integer): <input type="number" name="key" value="12345" required></label>
+        <button class="btn secondary" type="submit">Extract (WAV) ←</button>
+      </form>
+    </div>
+  </div>
+
+  {% if result %}
+    <hr>
+    <h2>Result</h2>
+    <div class="row">
+      {% if result.cover_preview %}
+        <div class="card preview">
+          <h3>Cover image preview</h3>
+          <img src="{{ result.cover_preview }}">
+          {% if result.cover_meta %}
+            <p class="muted">{{ result.cover_meta }}</p>
+          {% endif %}
+        </div>
+      {% endif %}
+
+      {% if result.stego_preview %}
+        <div class="card preview">
+          <h3>Stego image preview</h3>
+          <img src="{{ result.stego_preview }}">
+        </div>
+      {% endif %}
+
+      {% if result.lsb_preview %}
+        <div class="card preview">
+          <h3>LSB-plane preview</h3>
+          <img src="{{ result.lsb_preview }}">
+        </div>
+      {% endif %}
+
+      {% if result.diff_preview %}
+        <div class="card preview">
+          <h3>Difference preview</h3>
+          <img src="{{ result.diff_preview }}">
+        </div>
+      {% endif %}
+
+      {% if result.cover_audio_preview %}
+        <div class="card preview">
+          <h3>Cover audio preview</h3>
+          <audio controls src="{{ result.cover_audio_preview }}"></audio>
+          {% if result.audio_meta %}
+            <p class="muted">{{ result.audio_meta }}</p>
+          {% endif %}
+        </div>
+      {% endif %}
+
+      {% if result.stego_audio_preview %}
+        <div class="card preview">
+          <h3>Stego audio preview</h3>
+          <audio controls src="{{ result.stego_audio_preview }}"></audio>
+          {% if result.audio_diff_note %}
+            <p class="muted">{{ result.audio_diff_note }}</p>
+          {% endif %}
+        </div>
+      {% endif %}
+
+      {% if result.capacity %}
+        <div class="card" style="min-width:320px;">
+          <h3>Capacity Info</h3>
+          <table class="kv">
+            <tr><td class="key">Cover capacity</td><td>{{ result.capacity.cover_bytes }} bytes</td></tr>
+            <tr><td class="key">Header size</td><td>{{ result.capacity.header_bytes }} bytes</td></tr>
+            <tr><td class="key">Payload size</td><td>{{ result.capacity.payload_bytes }} bytes</td></tr>
+            <tr><td class="key">Required total</td><td>{{ result.capacity.required_bytes }} bytes</td></tr>
+            <tr><td class="key">Utilization</td><td>{{ result.capacity.utilization }}%</td></tr>
+            <tr><td class="key">LSBs used</td><td>{{ result.capacity.n_lsb }}</td></tr>
+            {% if result.capacity.hw %}<tr><td class="key">Image size</td><td>{{ result.capacity.hw }}</td></tr>{% endif %}
+            {% if result.capacity.wav_fmt %}<tr><td class="key">Audio format</td><td>{{ result.capacity.wav_fmt }}</td></tr>{% endif %}
+          </table>
+        </div>
+      {% endif %}
+    </div>
+
+    {% if result.download_url %}
+      <p><a class="btn" href="{{ result.download_url }}">Download stego image</a></p>
+    {% endif %}
+    {% if result.payload_name %}
+      <p><a class="btn" href="{{ url_for('download_payload') }}">Download extracted payload ({{ result.payload_name }})</a></p>
+    {% endif %}
+    {% if result.download_wav_url %}
+      <p><a class="btn" href="{{ result.download_wav_url }}">Download stego audio</a></p>
+    {% endif %}
+  {% endif %}
+</body>
+</html>
