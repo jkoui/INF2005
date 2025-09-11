@@ -1,10 +1,14 @@
+#stego header code
+
+# [ HEADER ] || [ CIPHERTEXT + TAG ]
+
 import os, struct
 from dataclasses import dataclass
 from typing import Tuple, Callable
 import numpy as np
 from werkzeug.utils import secure_filename
 
-MAGIC = b"ACW1"
+MAGIC = b"ACW1" 
 VER   = 1
 
 def bytes_to_bits(data: bytes) -> np.ndarray:
@@ -32,8 +36,19 @@ def safe_download_name_and_mime(ext: str):
     return name, table.get(ext.lower(), mime)
 
 # -------- Secure header layout --------
-# MAGIC(4) | VER(1) | FLAGS(1) | LSB(1) | START_OFFSET(8,BE) | PLAIN_LEN(4,BE) | NAME_LEN(1)
-# | NONCE(12) | SALT(16) | SHA256(32) | NAME(NAME_LEN, utf-8)
+# MAGIC(4) unique identifier for extracting the right stego object, like a signature
+# VER(1) | version
+# FLAGS(1) | for other purposes
+# LSB(1) | use how LSB to embed
+# START_OFFSET(8) | for advance embedding since not always start at position 0
+# PLAIN_LEN(4) | length of payload
+# NAME_LEN(1) | length of filename
+# NONCE(12) | vector for AES-GCM encryption
+# SALT(16) | used in KDF (key derivation func) to derive AES key
+# SHA256(32) | integrity check -> hash of plaintext
+# NAME(NAME_LEN, utf-8) | filename
+
+
 FIXED_LEN = 80   # bytes (without NAME)
 
 @dataclass
@@ -69,7 +84,7 @@ class StegoHeader:
 def build_secure_header(*, plain_len: int, filename: str, lsb_used: int,
                         start_offset: int, nonce: bytes, salt: bytes, sha256_bytes: bytes) -> bytes:
     return StegoHeader(
-        ver=VER, flags=0, lsb_used=int(lsb_used), start_offset=int(start_offset),
+        ver=VER, flags=0, lsb_used=int(lsb_used), start_offset=int(start_offset), 
         plain_len=int(plain_len), name=filename, nonce=nonce, salt=salt, sha256=sha256_bytes
     ).to_bytes()
 

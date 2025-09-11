@@ -1,6 +1,7 @@
 import io
 import os
 from typing import Tuple
+import os as _os
 
 from flask import Flask, render_template, request, send_file, redirect, url_for, flash
 from PIL import Image
@@ -8,7 +9,7 @@ from werkzeug.utils import secure_filename
 
 
 from stego.crypto import (
-    derive_key, encrypt_aes_gcm, decrypt_aes_gcm, sha256, SALT_LEN, NONCE_LEN, TAG_LEN
+    derive_key, encrypt_aes_gcm, decrypt_aes_gcm, sha256, SALT_LEN, TAG_LEN
 )
 
 from stego.core import (
@@ -57,8 +58,7 @@ def embed():
         payload_bytes = payload.read()
         orig_name = os.path.basename(payload.filename or "payload.bin")
 
-        # --- NEW: crypto ---
-        import os as _os
+        # --- crypto ---
         salt = _os.urandom(SALT_LEN)
         key_bytes = derive_key(int(key), salt)
         nonce, ciphertext_with_tag = encrypt_aes_gcm(key_bytes, payload_bytes, aad=None)
@@ -209,7 +209,6 @@ def embed_audio():
         payload_bytes = payload.read()
         orig_name = os.path.basename(payload.filename or "payload.bin")
 
-        import os as _os
         salt = _os.urandom(SALT_LEN)
         key_bytes = derive_key(int(key), salt)
         nonce, ciphertext_with_tag = encrypt_aes_gcm(key_bytes, payload_bytes, aad=None)
