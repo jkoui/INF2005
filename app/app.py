@@ -23,7 +23,8 @@ from stego.media import (
     load_image_from_file, save_image_to_bytes, image_capacity_bits,
     image_lsb_plane, image_diff, img_to_data_url,
     load_wav_from_file, save_wav_to_bytes, wav_capacity_bits,
-    audio_to_data_url, mean_abs_byte_delta
+    audio_to_data_url, mean_abs_byte_delta,
+    image_bit_plane, image_lsb_change_mask
 )
 
 app = Flask(__name__)
@@ -93,6 +94,22 @@ def embed():
         stego_png = save_image_to_bytes(stego_flat, shape)
         _LAST_STEGO = stego_png
 
+                # --- NEW: controls from form (with defaults) ---
+        bit = int(request.form.get("bit", "0"))               # 0..7
+        channel_map = {"all": None, "r": 0, "g": 1, "b": 2}
+        channel = channel_map.get(request.form.get("channel", "all"), None)
+
+        # --- existing previews you already build ---
+        stego_img = Image.open(io.BytesIO(stego_png)).convert("RGB")
+        stego_preview = img_to_data_url(stego_img)
+
+        # --- NEW: single-bit plane and change mask previews ---
+        bit_plane_img = image_bit_plane(stego_flat, shape, bit=bit, channel=channel)
+        bit_plane_preview = img_to_data_url(bit_plane_img)
+
+        change_mask_img = image_lsb_change_mask(flat, stego_flat, shape, bit=bit)
+        change_mask_preview = img_to_data_url(change_mask_img)
+
         cover_img = Image.fromarray(flat.reshape(shape[0], shape[1], 3).astype("uint8"), mode="RGB")
         cover_preview = img_to_data_url(cover_img)
         cover_meta = f"{shape[1]}×{shape[0]} px, 3 channels (RGB)"
@@ -121,6 +138,8 @@ def embed():
             "cover_meta": cover_meta,
             "stego_preview": stego_preview,
             "lsb_preview": lsb_preview,
+            "bit_plane_preview": bit_plane_preview,      # NEW: precise single-bit plane
+            "change_mask_preview": change_mask_preview,  # NEW: pixels changed at that bit
             "diff_preview": diff_preview,
             "capacity": capacity,
             "download_url": url_for("download_stego"),

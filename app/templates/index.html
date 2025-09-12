@@ -37,6 +37,28 @@
         <label>Payload (any file): <input required type="file" name="payload"></label>
         <label>LSBs (1–8): <input type="number" name="lsb" min="1" max="8" value="1" required></label>
         <label>Key (integer): <input type="number" name="key" value="12345" required></label>
+
+        <!-- NEW: preview controls -->
+        <label>Bit-plane (for previews)</label>
+        <select name="bit">
+          <option value="0" selected>0 (LSB)</option>
+          <option value="1">1</option>
+          <option value="2">2</option>
+          <option value="3">3</option>
+          <option value="4">4</option>
+          <option value="5">5</option>
+          <option value="6">6</option>
+          <option value="7">7 (MSB)</option>
+        </select>
+
+        <label>Channel (for previews)</label>
+        <select name="channel">
+          <option value="all" selected>All</option>
+          <option value="r">Red</option>
+          <option value="g">Green</option>
+          <option value="b">Blue</option>
+        </select>
+
         <button class="btn" type="submit">Embed →</button>
       </form>
       <p class="note">Supports images (PNG/BMP).</p>
@@ -102,6 +124,22 @@
         <div class="card preview">
           <h3>LSB-plane preview</h3>
           <img src="{{ result.lsb_preview }}">
+        </div>
+      {% endif %}
+
+      <!-- NEW: single-bit plane preview -->
+      {% if result.bit_plane_preview %}
+        <div class="card preview">
+          <h3>Single bit-plane preview</h3>
+          <img src="{{ result.bit_plane_preview }}">
+        </div>
+      {% endif %}
+
+      <!-- NEW: LSB change mask -->
+      {% if result.change_mask_preview %}
+        <div class="card preview">
+          <h3>LSB change mask</h3>
+          <img src="{{ result.change_mask_preview }}">
         </div>
       {% endif %}
 

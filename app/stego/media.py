@@ -95,3 +95,32 @@ def mean_abs_byte_delta(a: np.ndarray, b: np.ndarray) -> float:
     if n == 0:
         return 0.0
     return float(np.mean(np.abs(a[:n].astype(np.int16) - b[:n].astype(np.int16))))
+
+# ---- single-bit bit-plane preview (0..7) ----
+def image_bit_plane(flat: np.ndarray, shape: Tuple[int, int], bit: int = 0, channel: int | None = None) -> Image.Image:
+    """
+    bit: 0..7 (0 = LSB)
+    channel: None -> average across RGB; 0/1/2 -> R/G/B only
+    Returns grayscale PIL image with 0/255 values.
+    """
+    h, w = shape
+    arr = flat.reshape(h, w, 3).astype(np.uint8)
+    if channel is None:
+        plane = ((arr >> bit) & 1).mean(axis=2) >= 0.5
+        plane = (plane.astype(np.uint8) * 255)
+    else:
+        plane = (((arr[..., channel] >> bit) & 1) * 255).astype(np.uint8)
+    return Image.fromarray(plane, mode="L")
+
+# ---- LSB-change mask between cover and stego for a specific bit ----
+def image_lsb_change_mask(original_flat: np.ndarray, stego_flat: np.ndarray, shape: Tuple[int,int], bit: int = 0) -> Image.Image:
+    """
+    Highlights pixels where any channel changed at 'bit'.
+    Returns a binary (0/255) mask in grayscale.
+    """
+    h, w = shape
+    a = original_flat.reshape(h, w, 3).astype(np.uint8)
+    b = stego_flat.reshape(h, w, 3).astype(np.uint8)
+    changed = (((a ^ b) >> bit) & 1).any(axis=2)  # True where selected bit differs
+    mask = (changed.astype(np.uint8) * 255)
+    return Image.fromarray(mask, mode="L")
