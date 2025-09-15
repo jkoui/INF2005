@@ -19,6 +19,31 @@
     table.kv td.key { color:#555; }
     .muted { color:#666; }
     h2 { margin-top: 0; }
+
+    /* --- Drag & Drop --- */
+    .drop-zone {
+      border: 2px dashed #aaa;
+      border-radius: 8px;
+      padding: 20px;
+      text-align: center;
+      color: #666;
+      margin-top: 8px;
+      cursor: pointer;
+      font-size: 0.9em;
+    }
+    .drop-zone.dragover {
+      border-color: #333;
+      background: #f9f9f9;
+      color: #111;
+    }
+    .drop-zone input {
+      display: none;
+    }
+    .drop-zone .file-name {
+      margin-top: 8px;
+      font-size: 0.85em;
+      color: #333;
+    }
   </style>
 </head>
 <body>
@@ -33,12 +58,21 @@
     <div class="card" style="flex:1; min-width: 340px;">
       <h2>Embed (Image)</h2>
       <form action="{{ url_for('embed') }}" method="post" enctype="multipart/form-data">
-        <label>Cover image (PNG/BMP): <input required type="file" name="cover" accept=".png,.bmp,image/png,image/bmp"></label>
-        <label>Payload (any file): <input required type="file" name="payload"></label>
+        <label>Cover image (PNG/BMP):</label>
+        <div class="drop-zone">Drag & drop or click
+          <input required type="file" name="cover" accept=".png,.bmp,image/png,image/bmp">
+          <div class="file-name"></div>
+        </div>
+
+        <label>Payload (any file):</label>
+        <div class="drop-zone">Drag & drop or click
+          <input required type="file" name="payload">
+          <div class="file-name"></div>
+        </div>
+
         <label>LSBs (1–8): <input type="number" name="lsb" min="1" max="8" value="1" required></label>
         <label>Key (integer): <input type="number" name="key" value="12345" required></label>
 
-        <!-- NEW: preview controls -->
         <label>Bit-plane (for previews)</label>
         <select name="bit">
           <option value="0" selected>0 (LSB)</option>
@@ -67,7 +101,11 @@
     <div class="card" style="flex:1; min-width: 340px;">
       <h2>Extract (Image)</h2>
       <form action="{{ url_for('extract') }}" method="post" enctype="multipart/form-data">
-        <label>Stego image (PNG/BMP): <input required type="file" name="stego" accept=".png,.bmp,image/png,image/bmp"></label>
+        <label>Stego image (PNG/BMP):</label>
+        <div class="drop-zone">Drag & drop or click
+          <input required type="file" name="stego" accept=".png,.bmp,image/png,image/bmp">
+          <div class="file-name"></div>
+        </div>
         <label>LSBs (1–8): <input type="number" name="lsb" min="1" max="8" value="1" required></label>
         <label>Key (integer): <input type="number" name="key" value="12345" required></label>
         <button class="btn secondary" type="submit">Extract ←</button>
@@ -79,8 +117,18 @@
     <div class="card" style="flex:1; min-width: 340px;">
       <h2>Embed (Audio WAV)</h2>
       <form action="{{ url_for('embed_audio') }}" method="post" enctype="multipart/form-data">
-        <label>Cover audio (WAV/PCM 8/16-bit): <input required type="file" name="cover_wav" accept=".wav,audio/wav"></label>
-        <label>Payload (any file): <input required type="file" name="payload_wav"></label>
+        <label>Cover audio (WAV/PCM 8/16-bit):</label>
+        <div class="drop-zone">Drag & drop or click
+          <input required type="file" name="cover_wav" accept=".wav,audio/wav">
+          <div class="file-name"></div>
+        </div>
+
+        <label>Payload (any file):</label>
+        <div class="drop-zone">Drag & drop or click
+          <input required type="file" name="payload_wav">
+          <div class="file-name"></div>
+        </div>
+
         <label>LSBs (1–8): <input type="number" name="lsb" min="1" max="8" value="1" required></label>
         <label>Key (integer): <input type="number" name="key" value="12345" required></label>
         <button class="btn" type="submit">Embed (WAV) →</button>
@@ -91,7 +139,12 @@
     <div class="card" style="flex:1; min-width: 340px;">
       <h2>Extract (Audio WAV)</h2>
       <form action="{{ url_for('extract_audio') }}" method="post" enctype="multipart/form-data">
-        <label>Stego audio (WAV/PCM): <input required type="file" name="stego_wav" accept=".wav,audio/wav"></label>
+        <label>Stego audio (WAV/PCM):</label>
+        <div class="drop-zone">Drag & drop or click
+          <input required type="file" name="stego_wav" accept=".wav,audio/wav">
+          <div class="file-name"></div>
+        </div>
+
         <label>LSBs (1–8): <input type="number" name="lsb" min="1" max="8" value="1" required></label>
         <label>Key (integer): <input type="number" name="key" value="12345" required></label>
         <button class="btn secondary" type="submit">Extract (WAV) ←</button>
@@ -127,7 +180,6 @@
         </div>
       {% endif %}
 
-      <!-- NEW: single-bit plane preview -->
       {% if result.bit_plane_preview %}
         <div class="card preview">
           <h3>Single bit-plane preview</h3>
@@ -135,7 +187,6 @@
         </div>
       {% endif %}
 
-      <!-- NEW: LSB change mask -->
       {% if result.change_mask_preview %}
         <div class="card preview">
           <h3>LSB change mask</h3>
@@ -197,5 +248,38 @@
       <p><a class="btn" href="{{ result.download_wav_url }}">Download stego audio</a></p>
     {% endif %}
   {% endif %}
+
+  <script>
+    document.querySelectorAll(".drop-zone").forEach(zone => {
+      const input = zone.querySelector("input");
+      const fileNameDisplay = zone.querySelector(".file-name");
+
+      zone.addEventListener("click", () => input.click());
+
+      zone.addEventListener("dragover", e => {
+        e.preventDefault();
+        zone.classList.add("dragover");
+      });
+
+      zone.addEventListener("dragleave", () => {
+        zone.classList.remove("dragover");
+      });
+
+      zone.addEventListener("drop", e => {
+        e.preventDefault();
+        zone.classList.remove("dragover");
+        if (e.dataTransfer.files.length) {
+          input.files = e.dataTransfer.files;
+          fileNameDisplay.textContent = e.dataTransfer.files[0].name;
+        }
+      });
+
+      input.addEventListener("change", () => {
+        if (input.files.length) {
+          fileNameDisplay.textContent = input.files[0].name;
+        }
+      });
+    });
+  </script>
 </body>
 </html>
