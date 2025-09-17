@@ -19,6 +19,8 @@
     table.kv td.key { color:#555; }
     .muted { color:#666; }
     h2 { margin-top: 0; }
+    /* ROI rectangle styling */
+    #roiCanvas { cursor: crosshair; }
 
     /* --- Drag & Drop --- */
     .drop-zone {
@@ -92,6 +94,38 @@
           <option value="g">Green</option>
           <option value="b">Blue</option>
         </select>
+
+        <!-- Region of Interest (optional) -->
+        <fieldset style="margin-top:12px;">
+          <legend>Region (optional)</legend>
+          <label class="note">Leave blank to use the entire image.</label>
+
+          <div class="row" style="align-items:flex-start;">
+            <div style="min-width:320px;">
+              <!-- Live preview for drawing a rectangle -->
+              <div id="roiContainer" class="preview" style="position:relative; display:none; width:320px;">
+                <img id="roiImg" style="max-width:320px; border:1px solid #ccc; border-radius:8px;">
+                <canvas id="roiCanvas" style="position:absolute; inset:0; pointer-events:auto;"></canvas>
+              </div>
+              <div class="note" id="roiHelp" style="display:none; margin-top:6px;">
+                Tip: Click-drag on the image to select a rectangle. Coordinates auto-fill below.
+              </div>
+            </div>
+
+            <div>
+              <label>X1 (left): <input type="number" name="x1" id="x1" min="0" step="1"></label>
+              <label>Y1 (top):  <input type="number" name="y1" id="y1" min="0" step="1"></label>
+              <label>X2 (right):<input type="number" name="x2" id="x2" min="0" step="1"></label>
+              <label>Y2 (bottom):<input type="number" name="y2" id="y2" min="0" step="1"></label>
+
+              <!-- Natural size of the selected cover (backend can use this to validate) -->
+              <input type="hidden" name="nat_w" id="nat_w">
+              <input type="hidden" name="nat_h" id="nat_h">
+
+              <div class="note" id="roiMeta" style="margin-top:6px;"></div>
+            </div>
+          </div>
+        </fieldset>
 
         <button class="btn" type="submit">Embed →</button>
       </form>
@@ -270,6 +304,7 @@
         zone.classList.remove("dragover");
         if (e.dataTransfer.files.length) {
           input.files = e.dataTransfer.files;
+          input.dispatchEvent(new Event('change'));
           fileNameDisplay.textContent = e.dataTransfer.files[0].name;
         }
       });
@@ -280,6 +315,175 @@
         }
       });
     });
+  </script>
+  <script>
+    // ====== ROI: show preview when a cover image is chosen and enable drag-select ======
+    (function() {
+      const coverInput = document.querySelector('form[action$="embed"] input[name="cover"]');
+      const roiContainer = document.getElementById('roiContainer');
+      const roiImg = document.getElementById('roiImg');
+      const roiCanvas = document.getElementById('roiCanvas');
+      const roiHelp = document.getElementById('roiHelp');
+      const roiMeta = document.getElementById('roiMeta');
+
+      const x1El = document.getElementById('x1');
+      const y1El = document.getElementById('y1');
+      const x2El = document.getElementById('x2');
+      const y2El = document.getElementById('y2');
+      const natWEl = document.getElementById('nat_w');
+      const natHEl = document.getElementById('nat_h');
+
+      if (!coverInput) return;
+
+      // Load a client-side preview when a cover image is picked (click or drag&drop)
+      coverInput.addEventListener('change', () => {
+        const file = coverInput.files && coverInput.files[0];
+        if (!file) return;
+
+        if (!file.type.match(/^image\/(png|bmp)$/) && !file.name.match(/\.(png|bmp)$/i)) {
+          roiContainer.style.display = 'none';
+          roiHelp.style.display = 'none';
+          return;
+        }
+        const url = URL.createObjectURL(file);
+        roiImg.src = url;
+        roiImg.onload = () => {
+          // Natural size of the image
+          const natW = roiImg.naturalWidth;
+          const natH = roiImg.naturalHeight;
+          natWEl.value = natW;
+          natHEl.value = natH;
+
+          // show first so layout is valid
+          roiContainer.style.display = 'block';
+          roiHelp.style.display = 'block';
+
+          requestAnimationFrame(() => {
+            const dispW = roiImg.getBoundingClientRect().width || 320;
+            const scale = dispW / natW;
+            const dispH = natH * scale;
+
+            roiCanvas.width = dispW;
+            roiCanvas.height = dispH;
+
+            // Drawing state
+            let dragging = false;
+            let sx = 0, sy = 0, ex = 0, ey = 0;
+
+            const ctx = roiCanvas.getContext('2d');
+
+            function redraw() {
+              ctx.clearRect(0, 0, roiCanvas.width, roiCanvas.height);
+              const x = Math.min(sx, ex), y = Math.min(sy, ey);
+              const w = Math.abs(ex - sx), h = Math.abs(ey - sy);
+              ctx.lineWidth = 2;
+              ctx.setLineDash([6, 4]);
+              ctx.strokeStyle = 'rgba(0,0,0,0.85)';
+              ctx.strokeRect(x, y, w, h);
+              ctx.setLineDash([]);
+              ctx.fillStyle = 'rgba(0,0,0,0.15)';
+              ctx.fillRect(x, y, w, h);
+            }
+
+            function toNative(px, py) {
+              const nx = Math.round(px / scale);
+              const ny = Math.round(py / scale);
+              return [nx, ny];
+            }
+
+            function clamp(v, lo, hi){ return Math.max(lo, Math.min(hi, v)); }
+
+            // Repaint rectangle using the four inputs
+            function drawFromInputs() {
+              // read native coords (allow empty → treat as 0)
+              let nx1 = parseInt(x1El.value || 0, 10);
+              let ny1 = parseInt(y1El.value || 0, 10);
+              let nx2 = parseInt(x2El.value || 0, 10);
+              let ny2 = parseInt(y2El.value || 0, 10);
+
+              const natW = parseInt(natWEl.value, 10);
+              const natH = parseInt(natHEl.value, 10);
+
+              // clamp to native bounds
+              nx1 = clamp(nx1, 0, natW);
+              nx2 = clamp(nx2, 0, natW);
+              ny1 = clamp(ny1, 0, natH);
+              ny2 = clamp(ny2, 0, natH);
+
+              // ensure proper ordering
+              const left   = Math.min(nx1, nx2);
+              const right  = Math.max(nx1, nx2);
+              const top    = Math.min(ny1, ny2);
+              const bottom = Math.max(ny1, ny2);
+
+              // convert back to displayed coords
+              sx = left  * scale;
+              sy = top   * scale;
+              ex = right * scale;
+              ey = bottom* scale;
+
+              // write back clamped/ordered values (keeps inputs sane)
+              x1El.value = left;  y1El.value = top;
+              x2El.value = right; y2El.value = bottom;
+
+              // update meta text and redraw
+              const w = Math.max(0, right - left);
+              const h = Math.max(0, bottom - top);
+              roiMeta.textContent = (w && h) ? `Selected ${w} × ${h} px` : `No region selected (full image will be used).`;
+              redraw();
+            }
+
+            // Listen for manual edits (input = per keystroke; change = on blur)
+            ['input','change'].forEach(evt => {
+              x1El.addEventListener(evt, drawFromInputs);
+              y1El.addEventListener(evt, drawFromInputs);
+              x2El.addEventListener(evt, drawFromInputs);
+              y2El.addEventListener(evt, drawFromInputs);
+            });
+
+            // Optional: initialize once if fields already contain values
+            drawFromInputs();
+
+            roiCanvas.onmousedown = (e) => {
+              const rect = roiCanvas.getBoundingClientRect();
+              dragging = true;
+              sx = e.clientX - rect.left;
+              sy = e.clientY - rect.top;
+              ex = sx; ey = sy;
+              redraw();
+            };
+            roiCanvas.onmousemove = (e) => {
+              if (!dragging) return;
+              const rect = roiCanvas.getBoundingClientRect();
+              ex = e.clientX - rect.left;
+              ey = e.clientY - rect.top;
+              redraw();
+            };
+            window.addEventListener('mouseup', () => {
+              if (!dragging) return;
+              dragging = false;
+
+              const left   = Math.max(0, Math.min(sx, ex));
+              const top    = Math.max(0, Math.min(sy, ey));
+              const right  = Math.min(roiCanvas.width,  Math.max(sx, ex));
+              const bottom = Math.min(roiCanvas.height, Math.max(sy, ey));
+
+              const [nx1, ny1] = toNative(left, top);
+              const [nx2, ny2] = toNative(right, bottom);
+
+              x1El.value = nx1; y1El.value = ny1;
+              x2El.value = nx2; y2El.value = ny2;
+
+              const w = Math.max(0, nx2 - nx1);
+              const h = Math.max(0, ny2 - ny1);
+              roiMeta.textContent = (w && h)
+                ? `Selected ${w} × ${h} px`
+                : `No region selected (full image will be used).`;
+            }, { once: false });
+          });
+        };
+      });
+    })();
   </script>
 </body>
 </html>
