@@ -14,7 +14,7 @@ from stego.crypto import (
 
 from stego.core import (
     MAGIC, bytes_to_bits, bits_to_bytes, safe_download_name_and_mime,
-    build_secure_header, parse_secure_header
+    build_secure_header, parse_secure_header, FIXED_LEN
 )
 
 from stego.lsb import embed_bits_into_bytes, extract_bits_from_bytes
@@ -29,6 +29,56 @@ from stego.media import (
 
 app = Flask(__name__)
 app.secret_key = "acw1-secret"
+
+HEADER_KEY_MASK = 0xA5A5A5A5
+def header_key(user_key: int) -> int:
+    return int(user_key) ^ HEADER_KEY_MASK
+
+# ---------- ROI helpers (shared) ----------
+def _to_int_opt(s):
+    """Return int(s) or None if empty/invalid."""
+    try:
+        return int(s)
+    except Exception:
+        return None
+
+def parse_roi(form, img_w_actual: int, img_h_actual: int):
+    """
+    Read x1,y1,x2,y2 and nat_w,nat_h from the form.
+    Returns: (region_dict_or_None, imgW, imgH, sel_w, sel_h)
+    Raises ValueError if a zero-area ROI is provided.
+    """
+    x1 = _to_int_opt(form.get("x1"))
+    y1 = _to_int_opt(form.get("y1"))
+    x2 = _to_int_opt(form.get("x2"))
+    y2 = _to_int_opt(form.get("y2"))
+    nat_w = _to_int_opt(form.get("nat_w"))
+    nat_h = _to_int_opt(form.get("nat_h"))
+
+    # Use the image's natural size reported by the client if present
+    imgW = nat_w or img_w_actual
+    imgH = nat_h or img_h_actual
+
+    # If any coordinate is missing, treat as "no ROI"
+    if not all(v is not None for v in (x1, y1, x2, y2)):
+        return None, imgW, imgH, None, None
+
+    # Clamp to bounds
+    x1 = max(0, min(imgW, x1)); x2 = max(0, min(imgW, x2))
+    y1 = max(0, min(imgH, y1)); y2 = max(0, min(imgH, y2))
+
+    # Normalize order
+    if x2 < x1: x1, x2 = x2, x1
+    if y2 < y1: y1, y2 = y2, y1
+
+    sel_w = x2 - x1
+    sel_h = y2 - y1
+    if sel_w == 0 or sel_h == 0:
+        # User typed/dragged a line/point; reject
+        raise ValueError("Selected region has zero area.")
+
+    region = {"x1": x1, "y1": y1, "x2": x2, "y2": y2}
+    return region, imgW, imgH, sel_w, sel_h
 
 # in-memory artifacts
 _LAST_STEGO: bytes = b""
@@ -65,6 +115,24 @@ def embed():
         nonce, ciphertext_with_tag = encrypt_aes_gcm(key_bytes, payload_bytes, aad=None)
         plain_sha = sha256(payload_bytes)
 
+        cover.stream.seek(0)
+        flat, shape = load_image_from_file(cover)
+        H, W = shape
+        C = 3  # RGB
+
+        # ROI from form (optional, for EMBED only)
+        try:
+            region, imgW, imgH, sel_w, sel_h = parse_roi(request.form, W, H)
+        except ValueError as ve:
+            flash(f"{ve} Please draw a valid rectangle or leave it blank.")
+            return redirect(url_for("index"))
+
+        # Build secure header (stores ROI — defaults to full image if none)
+        if region:
+            x1, y1, x2, y2 = region["x1"], region["y1"], region["x2"], region["y2"]
+        else:
+            x1, y1, x2, y2 = 0, 0, W, H
+
         # Secure header (store lsb_used; start_offset=0 for now)
         header = build_secure_header(
             plain_len=len(payload_bytes),
@@ -74,51 +142,85 @@ def embed():
             nonce=nonce,
             salt=salt,
             sha256_bytes=plain_sha,
+            roi_x1=x1, roi_y1=y1, roi_x2=x2, roi_y2=y2
         )
 
-        # Embed header || ciphertext
-        blob = header + ciphertext_with_tag
-        data_bits = bytes_to_bits(blob)
+        # Bits to embed
+        header_bits = bytes_to_bits(header)
+        cipher_bits = bytes_to_bits(ciphertext_with_tag)
         header_bytes_len = len(header)
-        required_bytes = header_bytes_len + len(ciphertext_with_tag)
+        cipher_bytes_len  = len(ciphertext_with_tag)
+        required_bytes = header_bytes_len + cipher_bytes_len
 
-        cover.stream.seek(0)
-        flat, shape = load_image_from_file(cover)
-        cap_bits = image_capacity_bits(flat.size, n_lsb)
+        # Reserve a top strip for the header so ROI can never overwrite it
+        header_carrier_bytes = (header_bits.size + 8 - 1) // 8           # ceil
+        header_carrier_pixels = (header_carrier_bytes + 3 - 1) // 3      # ceil
+        header_rows = (header_carrier_pixels + W - 1) // W               # ceil
+        reserved_y2 = min(H, header_rows)                                # strip is rows [0 .. reserved_y2)
+
+        # Adjust/choose ROI so it does not include the reserved strip.
+        if region:
+            # Push ROI down if it overlaps the reserved strip.
+            x1, y1, x2, y2 = region["x1"], region["y1"], region["x2"], region["y2"]
+            y1 = max(y1, reserved_y2)
+            if y1 >= y2:
+                flash(f"ROI is too small after reserving top {reserved_y2} row(s) for the header.")
+                return redirect(url_for("index"))
+        else:
+            # No ROI provided → use the whole image *below* the header strip
+            x1, y1, x2, y2 = 0, reserved_y2, W, H
+
+        # Capacity of the (possibly adjusted) ROI
+        sel_w = x2 - x1
+        sel_h = y2 - y1
+        roi_pixels = sel_w * sel_h
+        cap_bits = roi_pixels * C * n_lsb
         cap_bytes = cap_bits // 8
-        if data_bits.size > cap_bits:
-            flash(f"Cover too small. Capacity={cap_bytes} bytes, Needed={required_bytes} bytes")
+        if cipher_bits.size > cap_bits:
+            flash(f"Cover too small. ROI capacity={cap_bytes} bytes, Needed={cipher_bytes_len} bytes")
             return redirect(url_for("index"))
+        
+        # ---- Write header into the dedicated top strip only ----
+        flat_mut = flat.copy()
+        strip_len_bytes = reserved_y2 * W * C
+        strip = flat_mut[:strip_len_bytes].copy()
+        strip_after = embed_bits_into_bytes(strip, header_bits, n_lsb, header_key(key))
+        flat_mut[:strip_len_bytes] = strip_after
 
-        stego_flat = embed_bits_into_bytes(flat, data_bits, n_lsb, key)
-        stego_png = save_image_to_bytes(stego_flat, shape)
+        # ---- Write ciphertext into ROI only (never touches header strip) ----
+        arr = flat_mut.reshape(H, W, C)
+        roi = arr[y1:y2, x1:x2, :]
+        roi_flat = roi.reshape(-1).copy()
+        stego_roi_flat = embed_bits_into_bytes(roi_flat, cipher_bits, n_lsb, key)
+        roi[:, :, :] = stego_roi_flat.reshape(roi.shape)
+        stego_flat_all = arr.reshape(-1)
+
+        stego_png = save_image_to_bytes(stego_flat_all, shape)
         _LAST_STEGO = stego_png
 
-                # --- NEW: controls from form (with defaults) ---
+        # preview controls
         bit = int(request.form.get("bit", "0"))               # 0..7
         channel_map = {"all": None, "r": 0, "g": 1, "b": 2}
         channel = channel_map.get(request.form.get("channel", "all"), None)
 
-        # --- existing previews you already build ---
+        # previews
+        cover_img = Image.fromarray(flat.reshape(H, W, C).astype("uint8"), mode="RGB")
+        cover_preview = img_to_data_url(cover_img)
+        cover_meta = f"{W}×{H} px, 3 channels (RGB)"
+
         stego_img = Image.open(io.BytesIO(stego_png)).convert("RGB")
         stego_preview = img_to_data_url(stego_img)
 
-        # --- NEW: single-bit plane and change mask previews ---
-        bit_plane_img = image_bit_plane(stego_flat, shape, bit=bit, channel=channel)
+        lsb_img = image_lsb_plane(stego_flat_all, n_lsb, shape)
+        lsb_preview = img_to_data_url(lsb_img)
+
+        bit_plane_img = image_bit_plane(stego_flat_all, shape, bit=bit, channel=channel)
         bit_plane_preview = img_to_data_url(bit_plane_img)
 
-        change_mask_img = image_lsb_change_mask(flat, stego_flat, shape, bit=bit)
+        change_mask_img = image_lsb_change_mask(flat, stego_flat_all, shape, bit=bit)
         change_mask_preview = img_to_data_url(change_mask_img)
 
-        cover_img = Image.fromarray(flat.reshape(shape[0], shape[1], 3).astype("uint8"), mode="RGB")
-        cover_preview = img_to_data_url(cover_img)
-        cover_meta = f"{shape[1]}×{shape[0]} px, 3 channels (RGB)"
-
-        stego_img = Image.open(io.BytesIO(stego_png)).convert("RGB")
-        stego_preview = img_to_data_url(stego_img)
-        lsb_img = image_lsb_plane(stego_flat, n_lsb, shape)
-        lsb_preview = img_to_data_url(lsb_img)
-        diff_img = image_diff(flat, stego_flat, shape)
+        diff_img = image_diff(flat, stego_flat_all, shape)
         diff_preview = img_to_data_url(diff_img)
 
         utilization = round((required_bytes / cap_bytes) * 100, 2) if cap_bytes else 0.0
@@ -129,14 +231,17 @@ def embed():
             "required_bytes": required_bytes,
             "utilization": utilization,
             "n_lsb": n_lsb,
-            "hw": f"{shape[1]}×{shape[0]}",
+            "hw": f"{W}×{H}",
             "wav_fmt": None,
+            "roi": f"x={x1}..{x2}, y={y1}..{y2} ({sel_w}×{sel_h}px) (top {reserved_y2} row(s) reserved)",
         }
+        if region:
+            capacity["roi"] = f"x={x1}..{x2}, y={y1}..{y2} ({sel_w}×{sel_h}px)"
 
         result = {
             "cover_preview": cover_preview,
             "cover_meta": cover_meta,
-            "stego_preview": stego_preview,
+            "stego_preview": stego_preview, 
             "lsb_preview": lsb_preview,
             "bit_plane_preview": bit_plane_preview,      # NEW: precise single-bit plane
             "change_mask_preview": change_mask_preview,  # NEW: pixels changed at that bit
@@ -145,6 +250,7 @@ def embed():
             "download_url": url_for("download_stego"),
         }
         return render_template("index.html", result=result)
+    
     except Exception as e:
         flash(f"Embed error: {e}")
         return redirect(url_for("index"))
@@ -162,29 +268,61 @@ def extract():
         stego = request.files.get("stego")
         n_lsb = int(request.form.get("lsb", "1"))
         key = int(request.form.get("key", "0"))
+
         if not stego:
             flash("Please provide a stego image.")
             return redirect(url_for("index"))
 
         stego.stream.seek(0)
         flat, shape = load_image_from_file(stego)
+        H, W = shape
+        C = 3
 
-        # Reader that always starts from the top of the permutation
-        def read_bits(nbits):
-            return extract_bits_from_bytes(flat, n_lsb, key, nbits)
+        # --- Read header from the dedicated top strip ---
+        # Use a strip big enough to hold the maximum possible header:
+        # FIXED_LEN + up to 255 bytes of filename
+        MAX_HDR_BYTES = FIXED_LEN + 255
+        max_hdr_pixels = (MAX_HDR_BYTES + 3 - 1) // 3
+        max_hdr_rows = (max_hdr_pixels + W - 1) // W
+        reserved_y2 = min(H, max_hdr_rows)
+        strip_len_bytes = reserved_y2 * W * C
+        strip = flat[:strip_len_bytes]
+
+        # Stateful reader over the strip only (matches how we embedded it)
+        read_cursor = {"ofs": 0}
+        def read_bits(nbits: int):
+            # slice the unread portion of the strip and advance
+            start = read_cursor["ofs"]
+            # compute how many bytes we need to expose; we can just pass the
+            # remaining strip because extract_bits_from_bytes reads from start
+            remaining = strip[start:]
+            out = extract_bits_from_bytes(remaining, n_lsb, header_key(key), nbits)
+            # advance by however many *carrier* bytes were consumed
+            # carrier bytes used = ceil(nbits / (8 * n_lsb)) per channel-byte
+            used_bytes = (nbits + (n_lsb * 8) - 1) // (n_lsb * 8)
+            read_cursor["ofs"] += used_bytes
+            return out
 
         # 1) Parse secure header to learn sizes/materials
         hdr, header_bits = parse_secure_header(read_bits)
 
+        # ROI from header (clamp just in case)
+        x1 = max(0, min(W, hdr.roi_x1))
+        y1 = max(0, min(H, hdr.roi_y1))
+        x2 = max(0, min(W, hdr.roi_x2))
+        y2 = max(0, min(H, hdr.roi_y2))
+        if x2 <= x1 or y2 <= y1:
+            raise ValueError("Invalid ROI stored in header.")
+
         # 2) Ciphertext length = plaintext length + 16 (AES-GCM tag)
         cipher_len = hdr.plain_len + TAG_LEN
-        total_bits = header_bits + cipher_len * 8
+        total_cipher_bits = cipher_len * 8
 
-        # 3) Extract whole (header + ciphertext), then slice
-        all_bits = extract_bits_from_bytes(flat, n_lsb, key, total_bits)
-        all_bytes = bits_to_bytes(all_bits)
-        header_bytes_len = header_bits // 8
-        ciphertext_with_tag = all_bytes[header_bytes_len : header_bytes_len + cipher_len]
+        arr = flat.reshape(H, W, C)
+        roi_flat = arr[y1:y2, x1:x2, :].reshape(-1)
+
+        cipher_bits = extract_bits_from_bytes(roi_flat, n_lsb, key, total_cipher_bits)
+        ciphertext_with_tag = bits_to_bytes(cipher_bits)
 
         # 4) Re-derive key & decrypt
         key_bytes = derive_key(int(key), hdr.salt)
@@ -241,6 +379,11 @@ def embed_audio():
             nonce=nonce,
             salt=salt,
             sha256_bytes=plain_sha,
+            # stash ROI (or zeros if no ROI)
+            roi_x1=region["x1"] if region else 0,
+            roi_y1=region["y1"] if region else 0,
+            roi_x2=region["x2"] if region else flat.reshape(H, W, 3).shape[1],  # default to full image
+            roi_y2=region["y2"] if region else flat.reshape(H, W, 3).shape[0],
         )
 
         blob = header + ciphertext_with_tag

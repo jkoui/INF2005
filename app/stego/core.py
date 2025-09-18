@@ -49,7 +49,7 @@ def safe_download_name_and_mime(ext: str):
 # NAME(NAME_LEN, utf-8) | filename
 
 
-FIXED_LEN = 80   # bytes (without NAME)
+FIXED_LEN = 96   # bytes (without NAME)
 
 @dataclass
 class StegoHeader:
@@ -62,6 +62,10 @@ class StegoHeader:
     nonce: bytes
     salt: bytes
     sha256: bytes
+    roi_x1: int
+    roi_y1: int
+    roi_x2: int
+    roi_y2: int
 
     def to_bytes(self) -> bytes:
         name_bytes = os.path.basename(self.name or "recovered.bin").encode("utf-8")
@@ -77,15 +81,21 @@ class StegoHeader:
             struct.pack("B", len(name_bytes)) +
             self.nonce +
             self.salt +
-            self.sha256
+            self.sha256 +
+            int(self.roi_x1).to_bytes(4, "big", signed=False) +
+            int(self.roi_y1).to_bytes(4, "big", signed=False) +
+            int(self.roi_x2).to_bytes(4, "big", signed=False) +
+            int(self.roi_y2).to_bytes(4, "big", signed=False)
         )
         return fixed + name_bytes
 
 def build_secure_header(*, plain_len: int, filename: str, lsb_used: int,
-                        start_offset: int, nonce: bytes, salt: bytes, sha256_bytes: bytes) -> bytes:
+                        start_offset: int, nonce: bytes, salt: bytes, sha256_bytes: bytes,
+                        roi_x1: int = 0, roi_y1: int = 0, roi_x2: int = 0, roi_y2: int = 0) -> bytes:
     return StegoHeader(
         ver=VER, flags=0, lsb_used=int(lsb_used), start_offset=int(start_offset), 
-        plain_len=int(plain_len), name=filename, nonce=nonce, salt=salt, sha256=sha256_bytes
+        plain_len=int(plain_len), name=filename, nonce=nonce, salt=salt, sha256=sha256_bytes,
+        roi_x1=int(roi_x1), roi_y1=int(roi_y1), roi_x2=int(roi_x2), roi_y2=int(roi_y2)
     ).to_bytes()
 
 def parse_secure_header(bit_reader: Callable[[int], np.ndarray]) -> Tuple[StegoHeader, int]:
@@ -110,6 +120,11 @@ def parse_secure_header(bit_reader: Callable[[int], np.ndarray]) -> Tuple[StegoH
     salt  = fixed[32:48]
     sha   = fixed[48:80]
 
+    roi_x1 = int.from_bytes(fixed[80:84], "big")
+    roi_y1 = int.from_bytes(fixed[84:88], "big")
+    roi_x2 = int.from_bytes(fixed[88:92], "big")
+    roi_y2 = int.from_bytes(fixed[92:96], "big")
+
     # Optional sanity checks
     if ver != VER:
         raise ValueError(f"Unsupported header version: {ver}")
@@ -129,7 +144,8 @@ def parse_secure_header(bit_reader: Callable[[int], np.ndarray]) -> Tuple[StegoH
 
     hdr = StegoHeader(
         ver=ver, flags=flags, lsb_used=lsb, start_offset=start,
-        plain_len=plen, name=name, nonce=nonce, salt=salt, sha256=sha
+        plain_len=plen, name=name, nonce=nonce, salt=salt, sha256=sha,
+        roi_x1=roi_x1, roi_y1=roi_y1, roi_x2=roi_x2, roi_y2=roi_y2
     )
     total_header_bits = (FIXED_LEN + nlen) * 8
     return hdr, total_header_bits
