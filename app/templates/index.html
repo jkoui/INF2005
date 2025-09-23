@@ -103,7 +103,7 @@
           <div class="row" style="align-items:flex-start;">
             <div style="min-width:320px;">
               <!-- Live preview for drawing a rectangle -->
-              <div id="roiContainer" class="preview" style="position:relative; display:none; width:320px;">
+              <div id="roiImgContainer" class="preview" style="position:relative; display:none; width:320px;">
                 <img id="roiImg" style="max-width:320px; border:1px solid #ccc; border-radius:8px;">
                 <canvas id="roiCanvas" style="position:absolute; inset:0; pointer-events:auto;"></canvas>
               </div>
@@ -165,7 +165,37 @@
 
         <label>LSBs (1–8): <input type="number" name="lsb" min="1" max="8" value="1" required></label>
         <label>Key (integer): <input type="number" name="key" value="12345" required></label>
-        <button class="btn" type="submit">Embed (WAV) →</button>
+        
+        <!-- Region of Interest (audio) -->
+        <fieldset style="margin-top:12px;">
+          <legend>Region (optional)</legend>
+          <label class="note">Leave blank to use the entire audio.</label>
+
+          <div class="row" style="align-items:flex-start;">
+            <div style="min-width:320px;">
+              <!-- Live preview for drawing a region -->
+              <div id="roiAudioContainer" class="preview" style="position:relative; display:block; width:320px; height: 60px;">
+                <audio id="roiAudio" style="max-width:320px; border:1px solid #ccc; border-radius:8px; z-index: 10; cursor: pointer;" controls></audio>
+                <canvas style="position:absolute; inset:0; pointer-events:none; z-index:0;"></canvas>
+              </div>
+              <div class="note" id="roiHelp" style="display:none; margin-top:6px;">
+                Tip: Click-drag on the audio visualizer to select a region. Coordinates auto-fill below.
+              </div>
+            </div>
+
+            <div>
+              <label>Start time (seconds): <input type="number" name="start_time" id="start_time" min="0" step="0.1"></label>
+              <label>End time (seconds):  <input type="number" name="end_time" id="end_time" min="0" step="0.1"></label>
+
+              <!-- Natural length of the selected audio (backend can use this to validate) -->
+              <input type="hidden" name="nat_length" id="nat_length">
+
+              <div class="note" id="roiMeta" style="margin-top:6px;"></div>
+            </div>
+          </div>
+        </fieldset>
+
+        <button class="btn" type="submit" style = "position:relative; z-index:10;">Embed (WAV) →</button>
       </form>
       <p class="note">Only uncompressed PCM WAV is supported.</p>
     </div>
@@ -320,7 +350,7 @@
     // ====== ROI: show preview when a cover image is chosen and enable drag-select ======
     (function() {
       const coverInput = document.querySelector('form[action$="embed"] input[name="cover"]');
-      const roiContainer = document.getElementById('roiContainer');
+      const roiImgContainer = document.getElementById('roiImgContainer');
       const roiImg = document.getElementById('roiImg');
       const roiCanvas = document.getElementById('roiCanvas');
       const roiHelp = document.getElementById('roiHelp');
@@ -341,7 +371,7 @@
         if (!file) return;
 
         if (!file.type.match(/^image\/(png|bmp)$/) && !file.name.match(/\.(png|bmp)$/i)) {
-          roiContainer.style.display = 'none';
+          roiImgContainer.style.display = 'none';
           roiHelp.style.display = 'none';
           return;
         }
@@ -355,7 +385,7 @@
           natHEl.value = natH;
 
           // show first so layout is valid
-          roiContainer.style.display = 'block';
+          roiImgContainer.style.display = 'block';
           roiHelp.style.display = 'block';
 
           requestAnimationFrame(() => {
@@ -481,6 +511,81 @@
                 : `No region selected (full image will be used).`;
             }, { once: false });
           });
+        };
+      });
+    })();
+
+    (function() {
+      const coverAudioInput = document.querySelector('form[action$="embed_audio"] input[name="cover_wav"]');
+      const roiAudioContainer = document.getElementById('roiAudioContainer');
+      const roiAudio = document.getElementById('roiAudio');
+      const roiAudioCanvas = document.getElementById('roiAudioCanvas');
+      const roiAudioHelp = document.getElementById('roiAudioHelp');
+      const roiAudioMeta = document.getElementById('roiAudioMeta');
+
+      const startTimeEl = document.getElementById('start_time');
+      const endTimeEl = document.getElementById('end_time');
+      const natLengthEl = document.getElementById('nat_length');
+
+      if (!coverAudioInput) return;
+
+      // Load audio and draw waveform on canvas
+      coverAudioInput.addEventListener('change', () => {
+        const file = coverAudioInput.files && coverAudioInput.files[0];
+        if (!file) return;
+
+        if (!file.type.match(/^audio\/(wav|pcm)$/) && !file.name.match(/\.(wav|pcm)$/i)) {
+          roiAudioContainer.style.display = 'none';
+          roiAudioHelp.style.display = 'none';
+          return;
+        }
+        const url = URL.createObjectURL(file);
+        roiAudio.src = url;
+
+        // When audio is loaded, decode it and draw waveform
+        const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+        const analyser = audioContext.createAnalyser();
+
+        const source = audioContext.createMediaElementSource(roiAudio);
+        source.connect(analyser);
+        analyser.connect(audioContext.destination);
+
+        roiAudio.oncanplay = () => {
+          const duration = roiAudio.duration;
+          natLengthEl.value = duration;
+
+          // Display the audio container and help text
+          roiAudioContainer.style.display = 'block';
+          roiAudioHelp.style.display = 'block';
+
+          const ctx = roiAudioCanvas.getContext('2d');
+
+          // Function to draw the audio waveform
+          const drawWaveform = () => {
+            analyser.fftSize = 2048;
+            const bufferLength = analyser.frequencyBinCount;
+            const dataArray = new Uint8Array(bufferLength);
+
+            analyser.getByteTimeDomainData(dataArray);
+
+            const width = roiAudioCanvas.width;
+            const height = roiAudioCanvas.height;
+            ctx.clearRect(0, 0, width, height);
+
+            const step = Math.ceil(dataArray.length / width);
+            const amp = height / 2;
+
+            for (let i = 0; i < width; i++) {
+              const min = Math.min(...dataArray.slice(i * step, (i + 1) * step));
+              const max = Math.max(...dataArray.slice(i * step, (i + 1) * step));
+              ctx.fillRect(i, (1 + min) * amp, 1, (max - min) * amp);
+            }
+          };
+
+          // Start drawing the waveform once the audio is playing
+          roiAudio.play();
+          drawWaveform();
+          requestAnimationFrame(drawWaveform);
         };
       });
     })();

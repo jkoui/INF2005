@@ -42,12 +42,29 @@ def _to_int_opt(s):
     except Exception:
         return None
 
-def parse_roi(form, img_w_actual: int, img_h_actual: int):
+def parse_roi(form, img_w_actual: int, img_h_actual: int, is_audio: bool = False):
     """
     Read x1,y1,x2,y2 and nat_w,nat_h from the form.
     Returns: (region_dict_or_None, imgW, imgH, sel_w, sel_h)
     Raises ValueError if a zero-area ROI is provided.
     """
+
+    # For audio
+    if is_audio:
+        start_time = _to_int_opt(form.get("start_time"))
+        end_time = _to_int_opt(form.get("end_time"))
+
+        # If any coordinate is missing, treat as "no ROI"
+        if start_time is None or end_time is None:
+            return None, img_w_actual, img_h_actual, None, None
+        
+        # Ensure valid time range
+        if start_time >= end_time:
+            raise ValueError("Start time must be less than end time.")
+
+        return {"start_time": start_time, "end_time": end_time}, img_w_actual, img_h_actual, end_time - start_time, None
+
+    # For image
     x1 = _to_int_opt(form.get("x1"))
     y1 = _to_int_opt(form.get("y1"))
     x2 = _to_int_opt(form.get("x2"))
@@ -153,8 +170,8 @@ def embed():
         required_bytes = header_bytes_len + cipher_bytes_len
 
         # Reserve a top strip for the header so ROI can never overwrite it
-        header_carrier_bytes = (header_bits.size + 8 - 1) // 8           # ceil
-        header_carrier_pixels = (header_carrier_bytes + 3 - 1) // 3      # ceil
+        header_carrier_bytes = (header_bits.size + 7) // 8           # ceil
+        header_carrier_pixels = (header_carrier_bytes + 2) // 3      # ceil
         header_rows = (header_carrier_pixels + W - 1) // W               # ceil
         reserved_y2 = min(H, header_rows)                                # strip is rows [0 .. reserved_y2)
 
@@ -254,6 +271,7 @@ def embed():
     except Exception as e:
         flash(f"Embed error: {e}")
         return redirect(url_for("index"))
+    
 
 @app.get("/download/stego")
 def download_stego():
@@ -282,7 +300,7 @@ def extract():
         # Use a strip big enough to hold the maximum possible header:
         # FIXED_LEN + up to 255 bytes of filename
         MAX_HDR_BYTES = FIXED_LEN + 255
-        max_hdr_pixels = (MAX_HDR_BYTES + 3 - 1) // 3
+        max_hdr_pixels = (MAX_HDR_BYTES + 2) // 3
         max_hdr_rows = (max_hdr_pixels + W - 1) // W
         reserved_y2 = min(H, max_hdr_rows)
         strip_len_bytes = reserved_y2 * W * C
@@ -371,6 +389,10 @@ def embed_audio():
         nonce, ciphertext_with_tag = encrypt_aes_gcm(key_bytes, payload_bytes, aad=None)
         plain_sha = sha256(payload_bytes)
 
+        # Parse ROI for audio (start_time and end_time)
+        region, _, _, sel_w, _ = parse_roi(request.form, 0, 0, is_audio=True)
+
+        # Build secure header (audio case)
         header = build_secure_header(
             plain_len=len(payload_bytes),
             filename=orig_name,
@@ -379,11 +401,10 @@ def embed_audio():
             nonce=nonce,
             salt=salt,
             sha256_bytes=plain_sha,
-            # stash ROI (or zeros if no ROI)
-            roi_x1=region["x1"] if region else 0,
-            roi_y1=region["y1"] if region else 0,
-            roi_x2=region["x2"] if region else flat.reshape(H, W, 3).shape[1],  # default to full image
-            roi_y2=region["y2"] if region else flat.reshape(H, W, 3).shape[0],
+            roi_x1=0,  # Audio does not have x/y coordinates like image
+            roi_y1=0,  # Audio uses time for ROI
+            roi_x2=sel_w,  # Audio "width" is its time range
+            roi_y2=sel_w,
         )
 
         blob = header + ciphertext_with_tag
@@ -391,6 +412,7 @@ def embed_audio():
         header_bytes_len = len(header)
         required_bytes = header_bytes_len + len(ciphertext_with_tag)
 
+        # WAV loading and capacity check
         cover.stream.seek(0)
         flat_bytes, wav_params, _ = load_wav_from_file(cover)
         cap_bits = wav_capacity_bits(flat_bytes.size, n_lsb)
