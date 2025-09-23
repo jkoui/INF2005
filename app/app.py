@@ -113,18 +113,41 @@ def embed():
     try:
         cover = request.files.get("cover")
         payload = request.files.get("payload")
+        additional_input = request.form.get("additional_input")
+        print(f"Additional Input: {additional_input}")  # Debugging line
         n_lsb = int(request.form.get("lsb", "1"))
         key = int(request.form.get("key", "0"))
 
-        if not cover or not payload:
-            flash("Please provide both cover and payload files.")
-            return redirect(url_for("index"))
-        if n_lsb < 1 or n_lsb > 8:
-            flash("LSBs must be between 1 and 8.")
+        # Ensure cover image is provided
+        if not cover:
+            flash("Please provide a cover image file.")
             return redirect(url_for("index"))
 
-        payload_bytes = payload.read()
-        orig_name = os.path.basename(payload.filename or "payload.bin")
+        # Validate payload or additional_input: only one should be filled
+        if not payload and not additional_input:
+            flash("Please provide either a payload file or input text.")
+            return redirect(url_for("index"))
+
+        if payload and additional_input:
+            flash("Please provide only one payload: either a file or text input.")
+            return redirect(url_for("index"))
+
+        # Process the payload (either file or text input)
+        if payload:
+            # If a file is provided, process it as the payload
+            payload_bytes = payload.read()
+            orig_name = os.path.basename(payload.filename or "payload.bin")
+        elif additional_input:
+            # If text input is provided, treat it as the payload
+            print(f"Processing input text as payload: {additional_input}")  # Debugging
+            payload_bytes = additional_input.encode('utf-8')  # Convert text to bytes
+            orig_name = "text_payload.txt"  # You can customize this name if needed
+
+        else:
+            flash("No valid payload provided.")
+            return redirect(url_for("index"))
+        
+
 
         # --- crypto ---
         salt = _os.urandom(SALT_LEN)

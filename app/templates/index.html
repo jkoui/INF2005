@@ -46,6 +46,16 @@
       font-size: 0.85em;
       color: #333;
     }
+
+    .input-group {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+
+    .note {
+      text-align: center;
+    }
   </style>
 </head>
 <body>
@@ -65,11 +75,16 @@
           <input required type="file" name="cover" accept=".png,.bmp,image/png,image/bmp">
           <div class="file-name"></div>
         </div>
-
+        
+        <div class="input-group">
         <label>Payload (any file):</label>
         <div class="drop-zone">Drag & drop or click
-          <input required type="file" name="payload">
+          <input required type="file" name="payload" id="payload">
           <div class="file-name"></div>
+        </div>
+        <p2 class="note">OR</p2>
+        <label>Input Text for Payload:</label>
+        <input type="text" name="additional_input" id="text_input" placeholder="Input Text" required>
         </div>
 
         <label>LSBs (1–8): <input type="number" name="lsb" min="1" max="8" value="1" required></label>
@@ -364,6 +379,21 @@
       const natHEl = document.getElementById('nat_h');
 
       if (!coverInput) return;
+
+              // Add event listener to toggle the required field based on input visibility
+      document.getElementById("payload").addEventListener("change", function() {
+        if (this.files.length > 0) {
+          document.getElementById("text_input").required = false; // Remove 'required' from text input
+          document.getElementById("payload").required = true; // Make the file input required
+        }
+      });
+
+      document.getElementById("text_input").addEventListener("input", function() {
+        if (this.value.trim() !== "") {
+          document.getElementById("payload").required = false; // Remove 'required' from file input
+          document.getElementById("text_input").required = true; // Make the text input required
+        }
+      });
 
       // Load a client-side preview when a cover image is picked (click or drag&drop)
       coverInput.addEventListener('change', () => {
