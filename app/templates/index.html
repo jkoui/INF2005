@@ -10,6 +10,8 @@
     .row { display:flex; gap:24px; flex-wrap: wrap; }
     .card { border:1px solid #ddd; border-radius:12px; padding:16px; }
     .preview img, .preview audio { max-width: 320px; border:1px solid #ccc; border-radius:8px; }
+    /* add this below to override for waveforms */
+    .preview img.wave { max-width: 1000px; width: 100%; }
     .btn { padding:8px 14px; border-radius:8px; border:1px solid #333; background:#111; color:#fff; cursor:pointer;}
     .btn.secondary { background:#fff; color:#111; }
     .note { color:#666; font-size: 0.9em; }
@@ -59,7 +61,7 @@
   </style>
 </head>
 <body>
-  <h1>ACW1 Stego (Web)</h1>
+  <h1>ACW1 Stego</h1>
   {% with messages = get_flashed_messages() %}
     {% if messages %}
       {% for m in messages %}<div class="flash">{{ m }}</div>{% endfor %}
@@ -371,6 +373,23 @@
           </p>
         </div>
       {% endif %}
+
+      {% if result.waveform_full_preview %}
+        <div class="card preview">
+          <h3>Waveform (Full Overview)</h3>
+          <img class="wave" src="{{ result.waveform_full_preview }}" alt="Waveform overview">
+          <p class="muted">Gray = cover, Red = stego, Blue = (stego − cover).</p>
+        </div>
+      {% endif %}
+
+      {% if result.waveform_zoom_preview %}
+        <div class="card preview">
+          <h3>Waveform (Zoomed)</h3>
+          <img class="wave" src="{{ result.waveform_zoom_preview }}" alt="Waveform zoom">
+          <p class="muted">Zoomed window; uses your ROI time range if provided.</p>
+        </div>
+      {% endif %}
+
 
       {% if result.capacity %}
         <div class="card" style="min-width:320px;">

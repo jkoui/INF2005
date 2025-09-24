@@ -211,6 +211,123 @@ def image_lsb_change_mask(original_flat: np.ndarray, stego_flat: np.ndarray, sha
     mask = (changed.astype(np.uint8) * 255)
     return Image.fromarray(mask, mode="L")
 
+
+def decode_mono(flat_bytes: np.ndarray, wav_params: dict) -> np.ndarray:
+    """
+    Convert interleaved PCM bytes → mono float32 in [-1, 1].
+    Supports 8-bit unsigned PCM and 16-bit signed PCM (little-endian).
+    """
+    nch = wav_params["nchannels"]
+    sw  = wav_params["sampwidth"]   # bytes per sample
+    if sw == 1:
+        # 8-bit PCM is unsigned in WAV: [0..255] with 128 as zero
+        arr = np.frombuffer(flat_bytes, dtype=np.uint8).astype(np.float32)
+        arr = (arr - 128.0) / 128.0
+    elif sw == 2:
+        # 16-bit PCM signed little-endian
+        arr = np.frombuffer(flat_bytes, dtype="<i2").astype(np.float32)
+        arr = arr / 32768.0
+    else:
+        raise ValueError(f"Unsupported sampwidth={sw*8} bit")
+
+    if nch > 1:
+        arr = arr.reshape(-1, nch).mean(axis=1)  # simple mono mixdown
+    return np.clip(arr, -1.0, 1.0)
+
+def peak_envelope(x: np.ndarray, width_px: int) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Downsample a 1D signal to min/max envelopes per pixel column.
+    """
+    n = x.size
+    if n == 0:
+        return np.zeros(width_px), np.zeros(width_px)
+    step = max(1, n // width_px)
+    mins = np.empty(width_px, dtype=np.float32)
+    maxs = np.empty(width_px, dtype=np.float32)
+    for i in range(width_px):
+        s = i * step
+        e = min(n, s + step)
+        if s >= n:
+            mins[i] = 0.0; maxs[i] = 0.0
+        else:
+            seg = x[s:e]
+            mins[i] = seg.min()
+            maxs[i] = seg.max()
+    return mins, maxs
+
+def draw_envelope(draw: ImageDraw.ImageDraw, mins, maxs, W, H, color, x_off=0, alpha=255):
+    """
+    Draw vertical lines between min/max envelopes onto an ImageDraw context.
+    """
+    mid = H // 2
+    s = (H * 0.45)  # scale to 90% of height
+    for x in range(W):
+        y1 = int(mid - maxs[x] * s)
+        y2 = int(mid - mins[x] * s)
+        draw.line((x_off + x, y1, x_off + x, y2), fill=(*color, alpha))
+
+def waveform_compare_image(
+    mono_cover: np.ndarray,
+    mono_stego: np.ndarray,
+    *,
+    framerate: int,
+    start_sample: int | None = None,
+    num_samples: int | None = None,
+    width: int = 800,
+    height: int = 220,
+    show_diff: bool = True,
+    bg=(255, 255, 255),
+) -> Image.Image:
+    """
+    Render cover vs stego envelopes (and optional diff = stego - cover).
+    If start_sample/num_samples provided, draws a zoom window.
+    """
+    N = min(mono_cover.size, mono_stego.size)
+    c = mono_cover[:N]; s = mono_stego[:N]
+    if start_sample is None or num_samples is None:
+        # Full overview
+        start_sample = 0
+        num_samples  = N
+    else:
+        start_sample = max(0, min(N, start_sample))
+        num_samples  = max(1, min(N - start_sample, num_samples))
+
+    seg_c = c[start_sample:start_sample + num_samples]
+    seg_s = s[start_sample:start_sample + num_samples]
+    seg_d = (seg_s - seg_c) if show_diff else None
+
+    img = Image.new("RGBA", (width, height), (*bg, 255))
+    drw = ImageDraw.Draw(img, "RGBA")
+
+    # grid & midline
+    mid = height // 2
+    drw.line((0, mid, width, mid), fill=(200, 200, 200, 255))
+    for gx in range(0, width, 100):
+        drw.line((gx, 0, gx, height), fill=(240, 240, 240, 255))
+
+    # envelopes
+    cmin, cmax = peak_envelope(seg_c, width)
+    smin, smax = peak_envelope(seg_s, width)
+
+    # Draw cover first (behind), then stego
+    draw_envelope(drw, cmin, cmax, width, height, color=(120, 120, 120), alpha=200)  # gray
+    draw_envelope(drw, smin, smax, width, height, color=(220, 40, 40), alpha=180)    # red
+
+    # Optional difference (blue)
+    if show_diff and seg_d is not None:
+        dmin, dmax = peak_envelope(seg_d, width)
+        draw_envelope(drw, dmin, dmax, width, height, color=(50, 90, 220), alpha=120)
+
+    # simple labels
+    ms = int(1000 * start_sample / max(1, framerate))
+    dur_ms = int(1000 * num_samples / max(1, framerate))
+    label = f"{ms}–{ms+dur_ms} ms  (window {dur_ms} ms)"
+    drw.rectangle((6, 6, 6+240, 6+38), fill=(255,255,255,220))
+    drw.text((12, 12), "cover=gray, stego=red, diff=blue", fill=(0,0,0,255))
+    drw.text((12, 26), label, fill=(0,0,0,255))
+
+    return img
+
 # -------- MP4 (frame-level) --------
 def load_video_from_file(file_or_path):
     """

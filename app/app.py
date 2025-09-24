@@ -34,7 +34,7 @@ from stego.media import (
     image_bit_plane, image_lsb_change_mask,
     load_video_from_file, save_video_to_bytes, video_capacity_bits,
     image_bit_plane, image_lsb_change_mask,
-    make_change_overlay  
+    make_change_overlay, decode_mono, waveform_compare_image   
 )
 
 from stego.steganalysis import ( chi_square_heatmap )
@@ -502,17 +502,79 @@ def embed_audio():
         header_bytes_len = len(header)
         required_bytes = header_bytes_len + len(ciphertext_with_tag)
 
-        # WAV loading and capacity check
+        # WAV loading
         cover.stream.seek(0)
         flat_bytes, wav_params, _ = load_wav_from_file(cover)
+        fr = wav_params["framerate"]
+        sw = wav_params["sampwidth"]         # bytes per sample
+        nc = wav_params["nchannels"]
+        byte_rate = fr * sw * nc
+        total_bytes = flat_bytes.size
+
+        # --- Compute ROI start/end in BYTES (from ROI seconds). If no ROI → full range.
+        start_byte, end_byte = 0, total_bytes
+        if region:
+            # region["start_time"], ["end_time"] are floats (seconds)
+            st = float(region["start_time"])
+            et = float(region["end_time"])
+            start_byte = int(max(0, min(total_bytes, st * byte_rate)))
+            end_byte   = int(max(0, min(total_bytes, et * byte_rate)))
+            if end_byte <= start_byte:
+                flash("Invalid audio ROI after clamping. Please choose a larger time range.")
+                return redirect(url_for("index"))
+
+        # Capacity check for your current approach (header+cipher embedded from start).
         cap_bits = wav_capacity_bits(flat_bytes.size, n_lsb)
         cap_bytes = cap_bits // 8
         if data_bits.size > cap_bits:
             flash(f"WAV too small. Capacity={cap_bytes} bytes, Needed={required_bytes} bytes")
             return redirect(url_for("index"))
 
+        # Embed (your current method: header+cipher from the start)
         stego_flat = embed_bits_into_bytes(flat_bytes, data_bits, n_lsb, key)
         stego_wav = save_wav_to_bytes(stego_flat, wav_params)
+
+
+         # ---- Waveform previews ----
+        mono_cover = decode_mono(flat_bytes, wav_params)
+        mono_stego = decode_mono(stego_flat, wav_params)
+        fr = wav_params["framerate"]
+        sw = wav_params["sampwidth"]
+        nc = wav_params["nchannels"]
+
+        # (A) Full overview
+        wave_full_img = waveform_compare_image(
+            mono_cover, mono_stego, framerate=fr, width=800, height=220, show_diff=True
+        )
+        wave_full_preview = img_to_data_url(wave_full_img)
+
+        # (B) Zoom around ROI time window (if you used the ROI version I gave earlier)
+        # If your current code doesn’t compute start_byte/end_byte, you can omit this block.
+        try:
+            start_byte  # if defined above
+            end_byte
+            start_sample = start_byte // (sw * nc)
+            num_samples  = max(1, (end_byte - start_byte) // (sw * nc))
+        except NameError:
+            if region:
+                start_sample = start_byte // (sw * nc)
+                num_samples  = max(1, (end_byte - start_byte) // (sw * nc))
+                # cap to ~200ms so it’s readable
+                num_samples = min(num_samples, int(fr * 0.200))
+            else:
+                center = mono_cover.size // 2
+                num_samples = int(fr * 0.150)
+                start_sample = max(0, center - num_samples // 2)
+
+        wave_zoom_img = waveform_compare_image(
+            mono_cover, mono_stego,
+            framerate=fr,
+            start_sample=start_sample,
+            num_samples=min(num_samples, int(fr * 0.200)),  # cap ~200ms so it’s readable
+            width=800, height=220, show_diff=True
+        )
+        wave_zoom_preview = img_to_data_url(wave_zoom_img)
+
         _LAST_STEGO_WAV = stego_wav
 
         cover_audio_preview = audio_to_data_url(save_wav_to_bytes(flat_bytes, wav_params))
@@ -541,6 +603,8 @@ def embed_audio():
             "audio_diff_note": audio_diff_note,
             "capacity": capacity,
             "download_wav_url": url_for("download_stego_wav"),
+            "waveform_full_preview": wave_full_preview,
+            "waveform_zoom_preview": wave_zoom_preview,
         }
         return render_template("index.html", result=result)
     except Exception as e:
