@@ -1,6 +1,7 @@
 import io
 import os
 from typing import Tuple
+import traceback
 import numpy as np
 import os as _os
 import subprocess
@@ -705,7 +706,6 @@ def extract_video():
             return redirect(url_for("index"))
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            # preserve extension (.mp4 or .mov)
             ext = os.path.splitext(stego.filename or "")[1].lower()
             if ext not in [".mp4", ".mov"]:
                 ext = ".mp4"
@@ -716,19 +716,32 @@ def extract_video():
                 # ---- Extract from I-frames ----
                 flat, meta, frames = load_video_from_file(input_video)
 
-                def read_bits_header(nbits):
-                    return extract_bits_from_bytes(flat, n_lsb, key, nbits)
+                # 1) Estimate maximum header size
+                MAX_HDR_BYTES = FIXED_LEN + 255
+                max_hdr_bits = MAX_HDR_BYTES * 8
 
-                hdr, header_bits = parse_secure_header(read_bits_header)
+                # 2) Read a large chunk first (header + possible payload)
+                all_bits = extract_bits_from_bytes(flat, n_lsb, key, max_hdr_bits)
+
+                # 3) Parse header from that bitstream
+                bit_cursor = {"ofs": 0}
+                def read_bits(nbits: int):
+                    start = bit_cursor["ofs"]
+                    out = all_bits[start:start+nbits]
+                    bit_cursor["ofs"] += nbits
+                    return out
+
+                hdr, header_bits = parse_secure_header(read_bits)
+
+                # 4) Now we know ciphertext length
                 cipher_len = hdr.plain_len + TAG_LEN
-                # 1) Extract header + cipher in one go
                 total_bits = header_bits + cipher_len * 8
-                all_bits = extract_bits_from_bytes(flat_bytes, n_lsb, key, total_bits)
 
-                # 2) Split them
+                # 5) Re-read header+ciphertext together (clean slice)
+                all_bits = extract_bits_from_bytes(flat, n_lsb, key, total_bits)
                 all_bytes = bits_to_bytes(all_bits)
+
                 header_bytes_len = header_bits // 8
-                hdr, _ = parse_secure_header(lambda nbits: all_bits[:nbits])  # or re-parse from all_bits[:header_bits]
                 ciphertext_with_tag = all_bytes[header_bytes_len: header_bytes_len + cipher_len]
 
             else:
@@ -738,30 +751,29 @@ def extract_video():
 
                 flat_bytes, wav_params, _ = load_wav_from_file(wav_in)
 
-                # cursor so we don’t reread from index 0
-                read_cursor = {"ofs": 0}
+                MAX_HDR_BYTES = FIXED_LEN + 255
+                max_hdr_bits = MAX_HDR_BYTES * 8
+                all_bits = extract_bits_from_bytes(flat_bytes, n_lsb, key, max_hdr_bits)
 
+                bit_cursor = {"ofs": 0}
                 def read_bits(nbits: int):
-                    start = read_cursor["ofs"]
-                    remaining = flat_bytes[start:]
-                    out = extract_bits_from_bytes(remaining, n_lsb, key, nbits)
-                    used_bytes = (nbits + (n_lsb * 8) - 1) // (n_lsb * 8)  # how many carrier bytes consumed
-                    read_cursor["ofs"] += used_bytes
+                    start = bit_cursor["ofs"]
+                    out = all_bits[start:start+nbits]
+                    bit_cursor["ofs"] += nbits
                     return out
 
-                # 1) Parse header
                 hdr, header_bits = parse_secure_header(read_bits)
 
-                # 2) Now read ciphertext bits right after header
                 cipher_len = hdr.plain_len + TAG_LEN
-                cipher_bits = read_bits(cipher_len * 8)
-                ciphertext_with_tag = bits_to_bytes(cipher_bits)
+                total_bits = header_bits + cipher_len * 8
 
-        # Rebuild ciphertext and decrypt
-        all_bytes = bits_to_bytes(all_bits)
-        header_bytes_len = header_bits // 8
-        ciphertext_with_tag = all_bytes[header_bytes_len: header_bytes_len + cipher_len]
+                all_bits = extract_bits_from_bytes(flat_bytes, n_lsb, key, total_bits)
+                all_bytes = bits_to_bytes(all_bits)
 
+                header_bytes_len = header_bits // 8
+                ciphertext_with_tag = all_bytes[header_bytes_len: header_bytes_len + cipher_len]
+
+        # ---- Common decrypt logic ----
         key_bytes = derive_key(int(key), hdr.salt)
         plaintext = decrypt_aes_gcm(key_bytes, hdr.nonce, ciphertext_with_tag, aad=None)
 
@@ -777,7 +789,9 @@ def extract_video():
         return render_template("index.html", result=result)
 
     except Exception as e:
-        flash(f"Extract Video error: {e}")
+        import traceback
+        print("EXTRACT_VIDEO ERROR:", traceback.format_exc())
+        flash(f"Extract Video error: {str(e) or type(e).__name__}")
         return redirect(url_for("index"))
 
 if __name__ == "__main__":
