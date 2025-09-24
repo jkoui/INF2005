@@ -1,7 +1,13 @@
 import io
 import os
 from typing import Tuple
+import numpy as np
 import os as _os
+import subprocess
+import tempfile
+import binascii
+import shutil
+
 
 from flask import Flask, render_template, request, send_file, redirect, url_for, flash
 from PIL import Image
@@ -24,7 +30,8 @@ from stego.media import (
     image_lsb_plane, image_diff, img_to_data_url,
     load_wav_from_file, save_wav_to_bytes, wav_capacity_bits,
     audio_to_data_url, mean_abs_byte_delta,
-    image_bit_plane, image_lsb_change_mask
+    image_bit_plane, image_lsb_change_mask,
+    load_video_from_file, save_video_to_bytes, video_capacity_bits  
 )
 
 app = Flask(__name__)
@@ -105,6 +112,33 @@ _LAST_PAYLOAD: Tuple[bytes, str] = (b"", "recovered.bin")
 @app.get("/")
 def index():
     return render_template("index.html", result=None)
+
+# ==========================================================
+# MP4 Audio utilities
+# ==========================================================
+def extract_audio_from_mp4(mp4_path, wav_path):
+    cmd = [
+        "ffmpeg", "-y", "-i", mp4_path,
+        "-vn", "-acodec", "pcm_s16le",
+        "-ac", "2", "-ar", "44100",
+        wav_path
+    ]
+    subprocess.run(cmd, check=True)
+
+
+def replace_audio_in_mp4(video_in, audio_wav, video_out):
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", video_in,
+        "-i", audio_wav,
+        "-c:v", "copy",
+        "-c:a", "pcm_s16le",
+        "-map", "0:v:0", "-map", "1:a:0",
+        "-shortest",
+        video_out
+    ]
+    subprocess.run(cmd, check=True)
+# ==========================================================
 
 # -------- Image routes --------
 @app.post("/embed")
@@ -548,5 +582,204 @@ def download_payload():
     _name, mime = safe_download_name_and_mime(ext if ext else ".bin")
     return send_file(io.BytesIO(data), as_attachment=True, download_name=fname, mimetype=mime)
 
+_LAST_STEGO_VIDEO: bytes = b""
+_LAST_STEGO_METHOD: str = "iframe"
+
+@app.post("/embed_video")
+def embed_video():
+    global _LAST_STEGO_VIDEO, _LAST_STEGO_METHOD
+    try:
+        cover = request.files.get("cover_video")
+        payload = request.files.get("payload_video")
+        method = request.form.get("method", "iframe")
+        n_lsb = int(request.form.get("lsb", "1"))
+        key = int(request.form.get("key", "0"))
+
+        if not cover or not payload:
+            flash("Please provide both cover and payload.")
+            return redirect(url_for("index"))
+
+        # --- crypto ---
+        payload_bytes = payload.read()
+        orig_name = os.path.basename(payload.filename or "payload.bin")
+        salt = _os.urandom(SALT_LEN)
+        key_bytes = derive_key(int(key), salt)
+        nonce, ciphertext_with_tag = encrypt_aes_gcm(key_bytes, payload_bytes, aad=None)
+        plain_sha = sha256(payload_bytes)
+
+        header = build_secure_header(
+            plain_len=len(payload_bytes),
+            filename=orig_name,
+            lsb_used=n_lsb,
+            start_offset=0,
+            nonce=nonce,
+            salt=salt,
+            sha256_bytes=plain_sha,
+            roi_x1=0, roi_y1=0, roi_x2=0, roi_y2=0
+        )
+
+        header_bits = bytes_to_bits(header)
+        cipher_bits = bytes_to_bits(ciphertext_with_tag)
+        all_bits = np.concatenate([header_bits, cipher_bits])
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_mp4 = os.path.join(tmpdir, "input.mp4")
+            cover.save(input_mp4)
+
+            if method == "iframe":
+                # ---- Video I-frame stego ----
+                flat, meta, frames = load_video_from_file(input_mp4)
+                cap_bits = video_capacity_bits(flat.size, n_lsb)
+                if all_bits.size > cap_bits:
+                    flash("Payload too large for video (I-frame).")
+                    return redirect(url_for("index"))
+
+                flat_mut = embed_bits_into_bytes(flat.copy(), all_bits, n_lsb, key)
+                stego_bytes = save_video_to_bytes(flat_mut, meta)
+
+            else:
+                # ---- Audio-track stego ----
+                wav_in = os.path.join(tmpdir, "audio_in.wav")
+                wav_out = os.path.join(tmpdir, "audio_out.wav")
+                mov_out = os.path.join(tmpdir, "stego_audio.mov")  # stay consistent
+
+                extract_audio_from_mp4(input_mp4, wav_in)
+
+                flat_bytes, wav_params, _ = load_wav_from_file(wav_in)
+                cap_bits = wav_capacity_bits(flat_bytes.size, n_lsb)
+                if all_bits.size > cap_bits:
+                    flash("Payload too large for audio track.")
+                    return redirect(url_for("index"))
+
+                flat_mut = embed_bits_into_bytes(flat_bytes.copy(), all_bits, n_lsb, key)
+                stego_wav = save_wav_to_bytes(flat_mut, wav_params)
+                with open(wav_out, "wb") as f:
+                    f.write(stego_wav)
+
+                # Mux back into MOV (PCM-safe)
+                replace_audio_in_mp4(input_mp4, wav_out, mov_out)
+                with open(mov_out, "rb") as f:
+                    stego_bytes = f.read()
+
+        _LAST_STEGO_VIDEO = stego_bytes
+        _LAST_STEGO_METHOD = method
+        result = {"download_video_url": url_for("download_stego_video")}
+        return render_template("index.html", result=result)
+
+    except Exception as e:
+        flash(f"Embed Video error: {e}")
+        return redirect(url_for("index"))
+
+@app.get("/download/stego_video")
+def download_stego_video():
+    if not _LAST_STEGO_VIDEO:
+        return redirect(url_for("index"))
+
+    if _LAST_STEGO_METHOD == "iframe":
+        filename = "stego_iframe.mp4"
+        mimetype = "video/mp4"
+    else:  # audio
+        filename = "stego_audio.mov"
+        mimetype = "video/quicktime"
+
+    return send_file(
+        io.BytesIO(_LAST_STEGO_VIDEO),
+        as_attachment=True,
+        download_name=filename,
+        mimetype=mimetype
+    )
+
+
+
+@app.post("/extract_video")
+def extract_video():
+    global _LAST_PAYLOAD
+    try:
+        stego = request.files.get("stego_video")
+        method = request.form.get("method", "iframe")
+        n_lsb = int(request.form.get("lsb", "1"))
+        key = int(request.form.get("key", "0"))
+
+        if not stego:
+            flash("Please provide a stego video.")
+            return redirect(url_for("index"))
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # preserve extension (.mp4 or .mov)
+            ext = os.path.splitext(stego.filename or "")[1].lower()
+            if ext not in [".mp4", ".mov"]:
+                ext = ".mp4"
+            input_video = os.path.join(tmpdir, "stego" + ext)
+            stego.save(input_video)
+
+            if method == "iframe":
+                # ---- Extract from I-frames ----
+                flat, meta, frames = load_video_from_file(input_video)
+
+                def read_bits_header(nbits):
+                    return extract_bits_from_bytes(flat, n_lsb, key, nbits)
+
+                hdr, header_bits = parse_secure_header(read_bits_header)
+                cipher_len = hdr.plain_len + TAG_LEN
+                # 1) Extract header + cipher in one go
+                total_bits = header_bits + cipher_len * 8
+                all_bits = extract_bits_from_bytes(flat_bytes, n_lsb, key, total_bits)
+
+                # 2) Split them
+                all_bytes = bits_to_bytes(all_bits)
+                header_bytes_len = header_bits // 8
+                hdr, _ = parse_secure_header(lambda nbits: all_bits[:nbits])  # or re-parse from all_bits[:header_bits]
+                ciphertext_with_tag = all_bytes[header_bytes_len: header_bytes_len + cipher_len]
+
+            else:
+                # ---- Extract from audio track ----
+                wav_in = os.path.join(tmpdir, "audio_in.wav")
+                extract_audio_from_mp4(input_video, wav_in)
+
+                flat_bytes, wav_params, _ = load_wav_from_file(wav_in)
+
+                # cursor so we don’t reread from index 0
+                read_cursor = {"ofs": 0}
+
+                def read_bits(nbits: int):
+                    start = read_cursor["ofs"]
+                    remaining = flat_bytes[start:]
+                    out = extract_bits_from_bytes(remaining, n_lsb, key, nbits)
+                    used_bytes = (nbits + (n_lsb * 8) - 1) // (n_lsb * 8)  # how many carrier bytes consumed
+                    read_cursor["ofs"] += used_bytes
+                    return out
+
+                # 1) Parse header
+                hdr, header_bits = parse_secure_header(read_bits)
+
+                # 2) Now read ciphertext bits right after header
+                cipher_len = hdr.plain_len + TAG_LEN
+                cipher_bits = read_bits(cipher_len * 8)
+                ciphertext_with_tag = bits_to_bytes(cipher_bits)
+
+        # Rebuild ciphertext and decrypt
+        all_bytes = bits_to_bytes(all_bits)
+        header_bytes_len = header_bits // 8
+        ciphertext_with_tag = all_bytes[header_bytes_len: header_bytes_len + cipher_len]
+
+        key_bytes = derive_key(int(key), hdr.salt)
+        plaintext = decrypt_aes_gcm(key_bytes, hdr.nonce, ciphertext_with_tag, aad=None)
+
+        if sha256(plaintext) != hdr.sha256:
+            raise ValueError("Integrity check failed (SHA-256 mismatch). Wrong key or corrupted data.")
+
+        fname = secure_filename(hdr.name or "recovered.bin")
+        if not os.path.splitext(fname)[1]:
+            fname += ".bin"
+        _LAST_PAYLOAD = (plaintext, fname)
+
+        result = {"payload_name": fname}
+        return render_template("index.html", result=result)
+
+    except Exception as e:
+        flash(f"Extract Video error: {e}")
+        return redirect(url_for("index"))
+
 if __name__ == "__main__":
     app.run(debug=True)
+

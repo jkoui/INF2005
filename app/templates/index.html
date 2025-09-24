@@ -231,6 +231,60 @@
     </div>
   </div>
 
+  <div class="row">
+  <div class="card" style="flex:1; min-width: 340px;">
+    <h2>Embed (Video MP4)</h2>
+    <form action="{{ url_for('embed_video') }}" method="post" enctype="multipart/form-data">
+      <label>Cover video (MP4):</label>
+      <div class="drop-zone">Drag & drop or click
+        <input required type="file" name="cover_video" accept=".mp4,video/mp4">
+        <div class="file-name"></div>
+      </div>
+
+      <label>Payload (any file):</label>
+      <div class="drop-zone">Drag & drop or click
+        <input required type="file" name="payload_video">
+        <div class="file-name"></div>
+      </div>
+
+      <label>Method:</label>
+      <select name="method" required>
+        <option value="iframe" selected>I-frame (video)</option>
+        <option value="audio">Audio track</option>
+      </select>
+
+      <label>LSBs (1–8): <input type="number" name="lsb" min="1" max="8" value="1" required></label>
+      <label>Key (integer): <input type="number" name="key" value="12345" required></label>
+
+      <button class="btn" type="submit">Embed (Video) →</button>
+    </form>
+    <p class="note">Supports MP4 video. Choose I-frame or Audio method.</p>
+  </div>
+
+  <div class="card" style="flex:1; min-width: 340px;">
+    <h2>Extract (Video MP4)</h2>
+    <form action="{{ url_for('extract_video') }}" method="post" enctype="multipart/form-data">
+      <label>Stego video (MP4):</label>
+      <div class="drop-zone">Drag & drop or click
+          <input type="file" name="stego_video" accept=".mp4,.mov">
+        <div class="file-name"></div>
+      </div>
+
+      <label>Method:</label>
+      <select name="method" required>
+        <option value="iframe" selected>I-frame</option>
+        <option value="audio">Audio track</option>
+      </select>
+
+      <label>LSBs (1–8): <input type="number" name="lsb" min="1" max="8" value="1" required></label>
+      <label>Key (integer): <input type="number" name="key" value="12345" required></label>
+
+      <button class="btn secondary" type="submit">Extract (Video) ←</button>
+    </form>
+  </div>
+</div>
+
+
   {% if result %}
     <hr>
     <h2>Result</h2>
@@ -325,6 +379,9 @@
     {% endif %}
     {% if result.download_wav_url %}
       <p><a class="btn" href="{{ result.download_wav_url }}">Download stego audio</a></p>
+    {% endif %}
+    {% if result.download_video_url %}
+      <p><a class="btn" href="{{ result.download_video_url }}">Download stego video</a></p>
     {% endif %}
   {% endif %}
 
