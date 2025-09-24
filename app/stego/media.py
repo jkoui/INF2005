@@ -4,7 +4,9 @@ import base64
 import io
 import wave
 from typing import Tuple
-
+import cv2
+import tempfile, shutil
+import os
 import numpy as np
 from PIL import Image
 
@@ -50,27 +52,38 @@ def img_to_data_url(pil_img: Image.Image) -> str:
     return "data:image/png;base64," + base64.b64encode(bio.getvalue()).decode("ascii")
 
 # -------- WAV (byte-level) --------
-def load_wav_from_file(file_storage):
+def load_wav_from_file(file_or_path):
     """
+    Accepts either a Flask FileStorage (with .stream) or a plain path string.
     Returns:
       flat_bytes (np.uint8 1-D),
       params (dict with nchannels, sampwidth, framerate, nframes, comptype, compname),
       raw_frames (bytes)
     """
-    with wave.open(file_storage.stream, "rb") as wf:
-        params = dict(
-            nchannels=wf.getnchannels(),
-            sampwidth=wf.getsampwidth(),
-            framerate=wf.getframerate(),
-            nframes=wf.getnframes(),
-            comptype=wf.getcomptype(),
-            compname=wf.getcompname(),
-        )
-        if params["comptype"] != "NONE":
-            raise ValueError("Only uncompressed PCM WAV is supported.")
-        if params["sampwidth"] not in (1, 2):
-            raise ValueError("Only 8-bit or 16-bit PCM WAV is supported.")
-        frames = wf.readframes(params["nframes"])
+    # Decide whether input is FileStorage or file path
+    if hasattr(file_or_path, "stream"):
+        wf = wave.open(file_or_path.stream, "rb")
+    else:
+        wf = wave.open(file_or_path, "rb")  # assume it's a path string
+
+    params = dict(
+        nchannels=wf.getnchannels(),
+        sampwidth=wf.getsampwidth(),
+        framerate=wf.getframerate(),
+        nframes=wf.getnframes(),
+        comptype=wf.getcomptype(),
+        compname=wf.getcompname(),
+    )
+    if params["comptype"] != "NONE":
+        wf.close()
+        raise ValueError("Only uncompressed PCM WAV is supported.")
+    if params["sampwidth"] not in (1, 2):
+        wf.close()
+        raise ValueError("Only 8-bit or 16-bit PCM WAV is supported.")
+
+    frames = wf.readframes(params["nframes"])
+    wf.close()
+
     flat = np.frombuffer(frames, dtype=np.uint8)  # byte-level view
     return flat.copy(), params, frames
 
@@ -124,3 +137,73 @@ def image_lsb_change_mask(original_flat: np.ndarray, stego_flat: np.ndarray, sha
     changed = (((a ^ b) >> bit) & 1).any(axis=2)  # True where selected bit differs
     mask = (changed.astype(np.uint8) * 255)
     return Image.fromarray(mask, mode="L")
+
+# -------- MP4 (frame-level) --------
+def load_video_from_file(file_storage):
+    """
+    Reads video frames into flat bytes.
+    Returns:
+      flat (np.uint8 1-D),
+      meta (dict: width, height, frames, fps, shape),
+      frames (list of RGB frames)
+    """
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
+        shutil.copyfileobj(file_storage.stream, tmp)
+        tmp_path = tmp.name
+
+    cap = cv2.VideoCapture(tmp_path)
+    if not cap.isOpened():
+        raise ValueError("Could not open video file.")
+
+    frames = []
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        frames.append(rgb)
+    cap.release()
+
+    os.remove(tmp_path)
+
+    if not frames:
+        raise ValueError("No frames loaded from video.")
+
+    h, w, _ = frames[0].shape
+    flat = np.concatenate([f.reshape(-1) for f in frames])
+    meta = {"width": w, "height": h, "frames": len(frames), "fps": fps, "shape": (h, w)}
+    return flat, meta, frames
+
+
+def save_video_to_bytes(flat: np.ndarray, meta: dict) -> bytes:
+    import tempfile, cv2, os
+
+    h, w = meta["shape"]
+    fps = int(meta["fps"])
+    frames = []
+    total = h * w * 3
+    for i in range(meta["frames"]):
+        start = i * total
+        end = start + total
+        frame = flat[start:end].reshape(h, w, 3).astype(np.uint8)
+        frames.append(frame)
+
+    # ---- use AVI with FFV1 codec (lossless) ----
+    fourcc = cv2.VideoWriter_fourcc(*'FFV1')
+    tmp_path = tempfile.mktemp(suffix=".avi")
+    out = cv2.VideoWriter(tmp_path, fourcc, fps, (w, h))
+    for f in frames:
+        out.write(cv2.cvtColor(f, cv2.COLOR_RGB2BGR))
+    out.release()
+
+    with open(tmp_path, "rb") as f:
+        data = f.read()
+    os.remove(tmp_path)
+    return data
+
+
+
+def video_capacity_bits(flat_len: int, n_lsb: int) -> int:
+    return flat_len * n_lsb
+
