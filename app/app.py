@@ -32,8 +32,12 @@ from stego.media import (
     load_wav_from_file, save_wav_to_bytes, wav_capacity_bits,
     audio_to_data_url, mean_abs_byte_delta,
     image_bit_plane, image_lsb_change_mask,
-    load_video_from_file, save_video_to_bytes, video_capacity_bits  
+    load_video_from_file, save_video_to_bytes, video_capacity_bits,
+    image_bit_plane, image_lsb_change_mask,
+    make_change_overlay  
 )
+
+from stego.steganalysis import ( chi_square_heatmap )
 
 app = Flask(__name__)
 app.secret_key = "acw1-secret"
@@ -273,6 +277,32 @@ def embed():
         stego_png = save_image_to_bytes(stego_flat_all, shape)
         _LAST_STEGO = stego_png
 
+        overlay_img = make_change_overlay(
+            cover_flat=flat,
+            stego_flat=stego_flat_all,
+            shape=(H, W),
+            n_lsb=n_lsb,
+            color=(255, 32, 32),   # red
+            alpha=0.6,             # could be a UI slider in the form later
+            dilate_px=1,           # could be a UI slider
+            outline_only=False,    # could be a UI toggle
+            roi=(x1, y1, x2, y2)   # draw cyan border around ROI
+        )
+        overlay_preview = img_to_data_url(overlay_img)
+
+        # Chi-square heatmap (delta mode, over all channels)
+        chi_img = chi_square_heatmap(
+            cover_flat=flat,
+            stego_flat=stego_flat_all,
+            shape=(H, W),
+            block=16,            # try 8, 16, or 32
+            channel=None,        # None = R+G+B combined
+            mode="delta",        # "delta" highlights suspected embedding
+            alpha=0.60,          # overlay strength
+            color=(255, 0, 0)    # red heat
+        )
+        chi_heatmap_preview = img_to_data_url(chi_img)
+
         # preview controls
         bit = int(request.form.get("bit", "0"))               # 0..7
         channel_map = {"all": None, "r": 0, "g": 1, "b": 2}
@@ -321,8 +351,10 @@ def embed():
             "bit_plane_preview": bit_plane_preview,      # NEW: precise single-bit plane
             "change_mask_preview": change_mask_preview,  # NEW: pixels changed at that bit
             "diff_preview": diff_preview,
+            "overlay_preview": overlay_preview,
             "capacity": capacity,
             "download_url": url_for("download_stego"),
+            "chi_heatmap_preview": chi_heatmap_preview,
         }
         return render_template("index.html", result=result)
     

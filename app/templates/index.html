@@ -2,7 +2,7 @@
 <html>
 <head>
   <meta charset="utf-8">
-  <title>ACW1 Stego (Web)</title>
+  <title>ACW1 Stego</title>
   <style>
     body { font-family: system-ui, Arial, sans-serif; margin: 24px; }
     fieldset { margin-bottom: 24px; }
@@ -306,6 +306,14 @@
         </div>
       {% endif %}
 
+      {% if result.overlay_preview %}
+        <div class="card preview">
+          <h3>Change Overlay (LSB changes)</h3>
+          <img src="{{ result.overlay_preview }}" alt="Change overlay">
+          <p class="muted">Red = pixels with altered LSBs</p>
+        </div>
+      {% endif %}
+
       {% if result.lsb_preview %}
         <div class="card preview">
           <h3>LSB-plane preview</h3>
@@ -351,6 +359,16 @@
           {% if result.audio_diff_note %}
             <p class="muted">{{ result.audio_diff_note }}</p>
           {% endif %}
+        </div>
+      {% endif %}
+
+      {% if result.chi_heatmap_preview %}
+        <div class="card preview">
+          <h3>Chi-Square Heatmap (Pairs-of-Values)</h3>
+          <img src="{{ result.chi_heatmap_preview }}" alt="Chi-Square heatmap">
+          <p class="muted">
+            Red = blocks where (cover χ² − stego χ²) is high ⇒ pairs look equalized in stego (suspicious).
+          </p>
         </div>
       {% endif %}
 
