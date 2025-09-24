@@ -191,7 +191,7 @@
               <!-- Live preview for drawing a region -->
               <div id="roiAudioContainer" class="preview" style="position:relative; display:block; width:320px; height: 60px;">
                 <audio id="roiAudio" style="max-width:320px; border:1px solid #ccc; border-radius:8px; z-index: 10; cursor: pointer;" controls></audio>
-                <canvas style="position:absolute; inset:0; pointer-events:none; z-index:0;"></canvas>
+                <canvas id="roiAudioCanvas" style="position:absolute; inset:0; pointer-events:none; z-index:0;"></canvas>
               </div>
               <div class="note" id="roiHelp" style="display:none; margin-top:6px;">
                 Tip: Click-drag on the audio visualizer to select a region. Coordinates auto-fill below.
@@ -205,7 +205,7 @@
               <!-- Natural length of the selected audio (backend can use this to validate) -->
               <input type="hidden" name="nat_length" id="nat_length">
 
-              <div class="note" id="roiMeta" style="margin-top:6px;"></div>
+              <div class="note" id="roiMetaAudio" style="margin-top:6px;"></div>
             </div>
           </div>
         </fieldset>
@@ -451,18 +451,33 @@
               return [nx, ny];
             }
 
-            function clamp(v, lo, hi){ return Math.max(lo, Math.min(hi, v)); }
+            // helper
+            function toIntOrNull(v) {
+              return (v === '' || v === null || v === undefined) ? null : Number.parseInt(v, 10);
+            }
+
+            // replace your clamp or keep it, but don't call it on nulls
+            function clamp(v, lo, hi){
+              return Math.max(lo, Math.min(hi, v));
+            }
 
             // Repaint rectangle using the four inputs
             function drawFromInputs() {
-              // read native coords (allow empty → treat as 0)
-              let nx1 = parseInt(x1El.value || 0, 10);
-              let ny1 = parseInt(y1El.value || 0, 10);
-              let nx2 = parseInt(x2El.value || 0, 10);
-              let ny2 = parseInt(y2El.value || 0, 10);
+              // read values; keep blanks as nulls
+              let nx1 = toIntOrNull(x1El.value);
+              let ny1 = toIntOrNull(y1El.value);
+              let nx2 = toIntOrNull(x2El.value);
+              let ny2 = toIntOrNull(y2El.value);
 
               const natW = parseInt(natWEl.value, 10);
               const natH = parseInt(natHEl.value, 10);
+
+              // if any is blank → treat as "no ROI": clear overlay, don't write back
+              if (nx1 == null || ny1 == null || nx2 == null || ny2 == null) {
+                ctx.clearRect(0, 0, roiCanvas.width, roiCanvas.height);
+                roiMeta.textContent = 'No region selected (full image will be used).';
+                return;
+              }
 
               // clamp to native bounds
               nx1 = clamp(nx1, 0, natW);
@@ -531,14 +546,20 @@
               const [nx1, ny1] = toNative(left, top);
               const [nx2, ny2] = toNative(right, bottom);
 
-              x1El.value = nx1; y1El.value = ny1;
-              x2El.value = nx2; y2El.value = ny2;
-
               const w = Math.max(0, nx2 - nx1);
               const h = Math.max(0, ny2 - ny1);
-              roiMeta.textContent = (w && h)
-                ? `Selected ${w} × ${h} px`
-                : `No region selected (full image will be used).`;
+
+              if (w && h) {
+                x1El.value = nx1; y1El.value = ny1;
+                x2El.value = nx2; y2El.value = ny2;
+                roiMeta.textContent = `Selected ${w} × ${h} px`;
+              } else {
+                // clicked without dragging → treat as no ROI
+                x1El.value = y1El.value = x2El.value = y2El.value = '';
+                roiMeta.textContent = 'No region selected (full image will be used).';
+                const ctx = roiCanvas.getContext('2d');
+                ctx.clearRect(0, 0, roiCanvas.width, roiCanvas.height);
+              }
             }, { once: false });
           });
         };
