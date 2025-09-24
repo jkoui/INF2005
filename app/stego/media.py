@@ -8,7 +8,7 @@ import cv2
 import tempfile, shutil
 import os
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw
 
 # -------- Images --------
 def load_image_from_file(file_storage):
@@ -50,6 +50,93 @@ def img_to_data_url(pil_img: Image.Image) -> str:
     bio = io.BytesIO()
     pil_img.save(bio, format="PNG")
     return "data:image/png;base64," + base64.b64encode(bio.getvalue()).decode("ascii")
+
+def dilate_mask(mask: np.ndarray, iterations: int = 1) -> np.ndarray:
+    """
+    Very simple 3x3 dilation without extra deps.
+    mask: HxW boolean
+    """
+    if iterations <= 0:
+        return mask
+    m = mask
+    H, W = m.shape
+    for _ in range(iterations):
+        # pad to avoid border checks
+        p = np.pad(m, 1, mode='constant', constant_values=False)
+        # 3x3 max filter via neighbor shifts
+        d = (
+            p[0:H,   0:W]   | p[0:H,   1:W+1] | p[0:H,   2:W+2] |
+            p[1:H+1, 0:W]   | p[1:H+1, 1:W+1] | p[1:H+1, 2:W+2] |
+            p[2:H+2, 0:W]   | p[2:H+2, 1:W+1] | p[2:H+2, 2:W+2]
+        )
+        m = d
+    return m
+
+def erode_mask(mask: np.ndarray, iterations: int = 1) -> np.ndarray:
+    # Erode = dilate of the inverse, then invert
+    if iterations <= 0: 
+        return mask
+    inv = ~mask
+    inv_dil = dilate_mask(inv, iterations=iterations)
+    return ~inv_dil
+
+def make_change_overlay(
+    cover_flat: np.ndarray,
+    stego_flat: np.ndarray,
+    shape: tuple,
+    *,
+    n_lsb: int = 1,
+    color=(255, 32, 32),
+    alpha: float = 0.6,
+    dilate_px: int = 1,
+    outline_only: bool = False,
+    roi: tuple | None = None   # (x1,y1,x2,y2) to draw border only (optional)
+) -> Image.Image:
+    """
+    Returns a PIL Image of the COVER with a colored overlay where LSBs changed.
+    - cover_flat / stego_flat: flattened uint8 arrays length H*W*3
+    - shape: (H, W)
+    """
+    H, W = shape
+    C = 3
+    cover = cover_flat.reshape(H, W, C).astype(np.uint8)
+    stego = stego_flat.reshape(H, W, C).astype(np.uint8)
+
+    # 1) Change mask for the LSB region
+    diff = cover ^ stego
+    lsb_mask_per_channel = (diff & ((1 << n_lsb) - 1)) != 0   # HxWxC bool
+    mask = lsb_mask_per_channel.any(axis=2)                    # HxW bool
+
+    # 2) Morphology: thicken or outline
+    if dilate_px > 0:
+        mask_d = dilate_mask(mask, iterations=dilate_px)
+    else:
+        mask_d = mask
+
+    if outline_only:
+        # Outline = dilated - eroded (or mask_d - erode(mask))
+        inner = erode_mask(mask_d, iterations=max(1, dilate_px))
+        mask_final = mask_d & (~inner)
+    else:
+        mask_final = mask_d
+
+    # 3) Blend overlay color on COVER (not STEGO) so the artifacts pop
+    out = cover.copy()
+    overlay = np.zeros_like(out, dtype=np.uint8)
+    overlay[:, :, 0] = color[0]
+    overlay[:, :, 1] = color[1]
+    overlay[:, :, 2] = color[2]
+
+    # alpha blend only where mask_final == True
+    m = mask_final[:, :, None]  # HxWx1
+    # out = (1 - alpha)*base + alpha*color on masked pixels
+    out = np.where(m, 
+                   (out.astype(np.float32) * (1.0 - alpha) + overlay.astype(np.float32) * alpha).astype(np.uint8),
+                   out)
+
+    img = Image.fromarray(out, mode="RGB")
+
+    return img
 
 # -------- WAV (byte-level) --------
 def load_wav_from_file(file_or_path):
