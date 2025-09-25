@@ -8,6 +8,7 @@ import subprocess
 import tempfile
 import binascii
 import shutil
+import math
 
 
 from flask import Flask, render_template, request, send_file, redirect, url_for, flash
@@ -34,10 +35,10 @@ from stego.media import (
     image_bit_plane, image_lsb_change_mask,
     load_video_from_file, save_video_to_bytes, video_capacity_bits,
     image_bit_plane, image_lsb_change_mask,
-    make_change_overlay, decode_mono, waveform_compare_image   
+    make_change_overlay  
 )
 
-from stego.steganalysis import ( chi_square_heatmap )
+from stego.steganalysis import ( chi_square_heatmap, decode_mono, waveform_compare_stacked  )
 
 app = Flask(__name__)
 app.secret_key = "acw1-secret"
@@ -47,10 +48,10 @@ def header_key(user_key: int) -> int:
     return int(user_key) ^ HEADER_KEY_MASK
 
 # ---------- ROI helpers (shared) ----------
-def _to_int_opt(s):
-    """Return int(s) or None if empty/invalid."""
+def to_float_opt(s):
+    """Return float or None if empty/invalid."""
     try:
-        return int(s)
+        return float(s)
     except Exception:
         return None
 
@@ -63,8 +64,8 @@ def parse_roi(form, img_w_actual: int, img_h_actual: int, is_audio: bool = False
 
     # For audio
     if is_audio:
-        start_time = _to_int_opt(form.get("start_time"))
-        end_time = _to_int_opt(form.get("end_time"))
+        start_time = to_float_opt(form.get("start_time"))
+        end_time = to_float_opt(form.get("end_time"))
 
         # If any coordinate is missing, treat as "no ROI"
         if start_time is None or end_time is None:
@@ -77,28 +78,38 @@ def parse_roi(form, img_w_actual: int, img_h_actual: int, is_audio: bool = False
         return {"start_time": start_time, "end_time": end_time}, img_w_actual, img_h_actual, end_time - start_time, None
 
     # For image
-    x1 = _to_int_opt(form.get("x1"))
-    y1 = _to_int_opt(form.get("y1"))
-    x2 = _to_int_opt(form.get("x2"))
-    y2 = _to_int_opt(form.get("y2"))
-    nat_w = _to_int_opt(form.get("nat_w"))
-    nat_h = _to_int_opt(form.get("nat_h"))
+    x1f = to_float_opt(form.get("x1"))
+    y1f = to_float_opt(form.get("y1"))
+    x2f = to_float_opt(form.get("x2"))
+    y2f = to_float_opt(form.get("y2"))
+    nat_w = to_float_opt(form.get("nat_w"))
+    nat_h = to_float_opt(form.get("nat_h"))
 
-    # Use the image's natural size reported by the client if present
-    imgW = nat_w or img_w_actual
-    imgH = nat_h or img_h_actual
+    # Use natural size if provided
+    imgW = int(nat_w) if nat_w is not None else int(img_w_actual)
+    imgH = int(nat_h) if nat_h is not None else int(img_h_actual)
 
-    # If any coordinate is missing, treat as "no ROI"
-    if not all(v is not None for v in (x1, y1, x2, y2)):
+    # Missing coords -> no ROI
+    if not all(v is not None for v in (x1f, y1f, x2f, y2f)):
         return None, imgW, imgH, None, None
 
     # Clamp to bounds
-    x1 = max(0, min(imgW, x1)); x2 = max(0, min(imgW, x2))
-    y1 = max(0, min(imgH, y1)); y2 = max(0, min(imgH, y2))
+    x1f = max(0.0, min(float(imgW), x1f)); x2f = max(0.0, min(float(imgW), x2f))
+    y1f = max(0.0, min(float(imgH), y1f)); y2f = max(0.0, min(float(imgH), y2f))
 
     # Normalize order
-    if x2 < x1: x1, x2 = x2, x1
-    if y2 < y1: y1, y2 = y2, y1
+    if x2f < x1f: x1f, x2f = x2f, x1f
+    if y2f < y1f: y1f, y2f = y2f, y1f
+    
+    # Convert to integer pixel rectangle (inclusive intent)
+    x1 = int(math.floor(x1f))
+    y1 = int(math.floor(y1f))
+    x2 = int(math.ceil(x2f))
+    y2 = int(math.ceil(y2f))
+
+    # Ensure within bounds after rounding
+    x1 = max(0, min(imgW, x1)); x2 = max(0, min(imgW, x2))
+    y1 = max(0, min(imgH, y1)); y2 = max(0, min(imgH, y2))
 
     sel_w = x2 - x1
     sel_h = y2 - y1
@@ -514,7 +525,6 @@ def embed_audio():
         # --- Compute ROI start/end in BYTES (from ROI seconds). If no ROI → full range.
         start_byte, end_byte = 0, total_bytes
         if region:
-            # region["start_time"], ["end_time"] are floats (seconds)
             st = float(region["start_time"])
             et = float(region["end_time"])
             start_byte = int(max(0, min(total_bytes, st * byte_rate)))
@@ -523,64 +533,82 @@ def embed_audio():
                 flash("Invalid audio ROI after clamping. Please choose a larger time range.")
                 return redirect(url_for("index"))
 
-        # Capacity check for your current approach (header+cipher embedded from start).
+        # --- Build header (avoid None in roi fields)
+        roi_len = end_byte - start_byte  # bytes; just a placeholder for "width"
+        header = build_secure_header(
+            plain_len=len(payload_bytes),
+            filename=orig_name,
+            lsb_used=n_lsb,
+            start_offset=start_byte,          # store offset so extractor/visuals know ROI
+            nonce=nonce,
+            salt=salt,
+            sha256_bytes=plain_sha,
+            roi_x1=start_byte,
+            roi_y1=0,
+            roi_x2=end_byte,                  # never None
+            roi_y2=roi_len,
+        )
+
+        # Bits to embed
+        blob = header + ciphertext_with_tag
+        data_bits = bytes_to_bits(blob)
+        header_bytes_len = len(header)
+        required_bytes = header_bytes_len + len(ciphertext_with_tag)
+
+        # Capacity check (current scheme embeds from start)
         cap_bits = wav_capacity_bits(flat_bytes.size, n_lsb)
         cap_bytes = cap_bits // 8
         if data_bits.size > cap_bits:
             flash(f"WAV too small. Capacity={cap_bytes} bytes, Needed={required_bytes} bytes")
             return redirect(url_for("index"))
 
-        # Embed (your current method: header+cipher from the start)
+        # Embed (whole stream)
         stego_flat = embed_bits_into_bytes(flat_bytes, data_bits, n_lsb, key)
         stego_wav = save_wav_to_bytes(stego_flat, wav_params)
-
-
-         # ---- Waveform previews ----
-        mono_cover = decode_mono(flat_bytes, wav_params)
-        mono_stego = decode_mono(stego_flat, wav_params)
-        fr = wav_params["framerate"]
-        sw = wav_params["sampwidth"]
-        nc = wav_params["nchannels"]
-
-        # (A) Full overview
-        wave_full_img = waveform_compare_image(
-            mono_cover, mono_stego, framerate=fr, width=800, height=220, show_diff=True
-        )
-        wave_full_preview = img_to_data_url(wave_full_img)
-
-        # (B) Zoom around ROI time window (if you used the ROI version I gave earlier)
-        # If your current code doesn’t compute start_byte/end_byte, you can omit this block.
-        try:
-            start_byte  # if defined above
-            end_byte
-            start_sample = start_byte // (sw * nc)
-            num_samples  = max(1, (end_byte - start_byte) // (sw * nc))
-        except NameError:
-            if region:
-                start_sample = start_byte // (sw * nc)
-                num_samples  = max(1, (end_byte - start_byte) // (sw * nc))
-                # cap to ~200ms so it’s readable
-                num_samples = min(num_samples, int(fr * 0.200))
-            else:
-                center = mono_cover.size // 2
-                num_samples = int(fr * 0.150)
-                start_sample = max(0, center - num_samples // 2)
-
-        wave_zoom_img = waveform_compare_image(
-            mono_cover, mono_stego,
-            framerate=fr,
-            start_sample=start_sample,
-            num_samples=min(num_samples, int(fr * 0.200)),  # cap ~200ms so it’s readable
-            width=800, height=220, show_diff=True
-        )
-        wave_zoom_preview = img_to_data_url(wave_zoom_img)
-
         _LAST_STEGO_WAV = stego_wav
 
+        # ---- Waveform previews ----
+        mono_cover = decode_mono(flat_bytes, wav_params)
+        mono_stego = decode_mono(stego_flat,  wav_params)
+
+        # ROI ms (for highlight band)
+        roi_start_ms = 1000.0 * start_byte / byte_rate
+        roi_end_ms   = 1000.0 * end_byte   / byte_rate
+
+        # FULL overview (whole file) stacked:
+        full_img = waveform_compare_stacked(
+            mono_cover, mono_stego,
+            framerate=fr,
+            start_sample=0, num_samples=None,   # entire file
+            width=1100, lane_h=180, lane_gap=28,
+            show_diff=True, diff_gain=2.0,
+            highlight_ms=(roi_start_ms, roi_end_ms) if region else None
+        )
+        waveform_full_preview = img_to_data_url(full_img)
+
+        # ZOOM: exact user ROI (or 150 ms center if none)
+        if region:
+            start_sample = start_byte // (sw * nc)
+            num_samples  = max(1, (end_byte - start_byte) // (sw * nc))
+        else:
+            center = mono_cover.size // 2
+            num_samples = max(1, int(fr * 0.150))
+            start_sample = max(0, center - num_samples // 2)
+
+        zoom_img = waveform_compare_stacked(
+            mono_cover, mono_stego,
+            framerate=fr,
+            start_sample=start_sample, num_samples=num_samples,
+            width=1100, lane_h=180, lane_gap=28,
+            show_diff=True, diff_gain="auto",
+            highlight_ms=None
+        )
+        waveform_zoom_preview = img_to_data_url(zoom_img)
+
+        # Previews + stats
         cover_audio_preview = audio_to_data_url(save_wav_to_bytes(flat_bytes, wav_params))
         stego_audio_preview = audio_to_data_url(stego_wav)
         fmt = f"{wav_params['nchannels']} ch, {8*wav_params['sampwidth']}-bit, {wav_params['framerate']} Hz, {wav_params['nframes']} frames"
-        audio_meta = fmt
         delta = mean_abs_byte_delta(flat_bytes, stego_flat)
         audio_diff_note = f"Mean absolute byte delta: {delta:.3f}"
 
@@ -594,19 +622,22 @@ def embed_audio():
             "n_lsb": n_lsb,
             "hw": None,
             "wav_fmt": fmt,
+            "roi_time": f"{roi_start_ms/1000:.3f}s – {roi_end_ms/1000:.3f}s" if region else None,
+            "roi_bytes": (end_byte - start_byte) if region else None,
         }
 
         result = {
             "cover_audio_preview": cover_audio_preview,
             "stego_audio_preview": stego_audio_preview,
-            "audio_meta": audio_meta,
+            "audio_meta": fmt,
             "audio_diff_note": audio_diff_note,
             "capacity": capacity,
             "download_wav_url": url_for("download_stego_wav"),
-            "waveform_full_preview": wave_full_preview,
-            "waveform_zoom_preview": wave_zoom_preview,
+            "waveform_full_preview": waveform_full_preview,
+            "waveform_zoom_preview": waveform_zoom_preview,
         }
         return render_template("index.html", result=result)
+
     except Exception as e:
         flash(f"Embed WAV error: {e}")
         return redirect(url_for("index"))
