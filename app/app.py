@@ -493,37 +493,18 @@ def embed_audio():
         # Parse ROI for audio (start_time and end_time)
         region, _, _, sel_w, _ = parse_roi(request.form, 0, 0, is_audio=True)
 
-        # Build secure header (audio case)
-        header = build_secure_header(
-            plain_len=len(payload_bytes),
-            filename=orig_name,
-            lsb_used=n_lsb,
-            start_offset=0,
-            nonce=nonce,
-            salt=salt,
-            sha256_bytes=plain_sha,
-            roi_x1=0,  # Audio does not have x/y coordinates like image
-            roi_y1=0,  # Audio uses time for ROI
-            roi_x2=sel_w,  # Audio "width" is its time range
-            roi_y2=sel_w,
-        )
-
-        blob = header + ciphertext_with_tag
-        data_bits = bytes_to_bits(blob)
-        header_bytes_len = len(header)
-        required_bytes = header_bytes_len + len(ciphertext_with_tag)
-
         # WAV loading
         cover.stream.seek(0)
         flat_bytes, wav_params, _ = load_wav_from_file(cover)
         fr = wav_params["framerate"]
         sw = wav_params["sampwidth"]         # bytes per sample
         nc = wav_params["nchannels"]
-        byte_rate = fr * sw * nc
+        frame_size = sw * nc                  # bytes per frame
+        byte_rate = fr * frame_size
         total_bytes = flat_bytes.size
 
-        # --- Compute ROI start/end in BYTES (from ROI seconds). If no ROI → full range.
-        start_byte, end_byte = 0, total_bytes
+        # --- Compute ROI start/end in BYTES from ROI seconds (if any)
+        start_byte, end_byte = 0, total_bytes       
         if region:
             st = float(region["start_time"])
             et = float(region["end_time"])
@@ -533,20 +514,27 @@ def embed_audio():
                 flash("Invalid audio ROI after clamping. Please choose a larger time range.")
                 return redirect(url_for("index"))
 
-        # --- Build header (avoid None in roi fields)
-        roi_len = end_byte - start_byte  # bytes; just a placeholder for "width"
+        # --- Align ROI to frame boundaries
+        if region:
+            start_byte = (start_byte // frame_size) * frame_size
+            end_byte   = (end_byte   // frame_size) * frame_size
+            end_byte   = max(end_byte, start_byte + frame_size)  # ensure >= 1 frame
+        else:
+            start_byte, end_byte = 0, total_bytes
+
+        roi_len_bytes = end_byte - start_byte
+
+        # --- Build header only once (with aligned ROI)
         header = build_secure_header(
             plain_len=len(payload_bytes),
             filename=orig_name,
             lsb_used=n_lsb,
-            start_offset=start_byte,          # store offset so extractor/visuals know ROI
+            start_offset=start_byte,          # where embedding begins
             nonce=nonce,
             salt=salt,
             sha256_bytes=plain_sha,
-            roi_x1=start_byte,
-            roi_y1=0,
-            roi_x2=end_byte,                  # never None
-            roi_y2=roi_len,
+            roi_x1=start_byte, roi_y1=0,
+            roi_x2=end_byte,   roi_y2=roi_len_bytes,
         )
 
         # Bits to embed
@@ -555,15 +543,30 @@ def embed_audio():
         header_bytes_len = len(header)
         required_bytes = header_bytes_len + len(ciphertext_with_tag)
 
-        # Capacity check (current scheme embeds from start)
-        cap_bits = wav_capacity_bits(flat_bytes.size, n_lsb)
+        # --- Capacity check should use ROI capacity (not full file)
+        cap_bits = wav_capacity_bits(roi_len_bytes if region else total_bytes, n_lsb)
         cap_bytes = cap_bits // 8
         if data_bits.size > cap_bits:
-            flash(f"WAV too small. Capacity={cap_bytes} bytes, Needed={required_bytes} bytes")
+            where = "selected region" if region else "WAV"
+            flash(f"{where} too small. Capacity={cap_bytes} bytes, Needed={required_bytes} bytes")
             return redirect(url_for("index"))
 
-        # Embed (whole stream)
-        stego_flat = embed_bits_into_bytes(flat_bytes, data_bits, n_lsb, key)
+        # --- Embed ONLY inside the ROI
+        if region:
+            stego_flat = flat_bytes.copy()
+            roi_cover = flat_bytes[start_byte:end_byte]
+            roi_stego = embed_bits_into_bytes(roi_cover, data_bits, n_lsb, key)
+            stego_flat[start_byte:end_byte] = roi_stego
+        else:
+            stego_flat = embed_bits_into_bytes(flat_bytes, data_bits, n_lsb, key)
+
+
+        cap_bytes = cap_bits // 8
+        if data_bits.size > cap_bits:
+            where = "selected region" if region else "WAV"
+            flash(f"{where} too small. Capacity={cap_bytes} bytes, Needed={required_bytes} bytes")
+            return redirect(url_for("index"))
+
         stego_wav = save_wav_to_bytes(stego_flat, wav_params)
         _LAST_STEGO_WAV = stego_wav
 
@@ -623,8 +626,9 @@ def embed_audio():
             "hw": None,
             "wav_fmt": fmt,
             "roi_time": f"{roi_start_ms/1000:.3f}s – {roi_end_ms/1000:.3f}s" if region else None,
-            "roi_bytes": (end_byte - start_byte) if region else None,
+            "roi_bytes": roi_len_bytes if region else None,
         }
+
 
         result = {
             "cover_audio_preview": cover_audio_preview,
