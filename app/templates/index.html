@@ -252,7 +252,6 @@
       <label>Method:</label>
       <select name="method" required>
         <option value="iframe" selected>I-frame (video)</option>
-        <option value="audio">Audio track</option>
       </select>
 
       <label>LSBs (1–8): <input type="number" name="lsb" min="1" max="8" value="1" required></label>
@@ -260,7 +259,7 @@
 
       <button class="btn" type="submit">Embed (Video) →</button>
     </form>
-    <p class="note">Supports MP4 video. Choose I-frame or Audio method.</p>
+    <p class="note">Supports MP4 video.</p>
   </div>
 
   <div class="card" style="flex:1; min-width: 340px;">
@@ -268,14 +267,13 @@
     <form action="{{ url_for('extract_video') }}" method="post" enctype="multipart/form-data">
       <label>Stego video (MP4):</label>
       <div class="drop-zone">Drag & drop or click
-          <input type="file" name="stego_video" accept=".mp4,.mov">
+          <input type="file" name="stego_video" accept=".mp4,.mov,.mkv">
         <div class="file-name"></div>
       </div>
 
       <label>Method:</label>
       <select name="method" required>
         <option value="iframe" selected>I-frame</option>
-        <option value="audio">Audio track</option>
       </select>
 
       <label>LSBs (1–8): <input type="number" name="lsb" min="1" max="8" value="1" required></label>
@@ -406,6 +404,33 @@
           </table>
         </div>
       {% endif %}
+      {% if result and result.orig_stream_url and result.stego_stream_url %}
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:16px">
+          <div>
+            <h3>Original (preview)</h3>
+            <video controls preload="metadata" style="width:100%;max-height:360px;">
+              <source src="{{ result.orig_stream_url }}" type="video/mp4" />
+              Your browser does not support the video tag.
+            </video>
+          </div>
+          <div>
+            <h3>Stego (preview)</h3>
+            <video controls preload="metadata" style="width:100%;max-height:360px;">
+              <source src="{{ result.stego_stream_url }}" type="video/mp4" />
+              Your browser does not support the video tag.
+            </video>
+          </div>
+        </div>
+        {% endif %}
+
+        {% if result and result.download_video_url %}
+          <p style="margin-top:12px">
+            <a href="{{ result.download_video_url }}" class="btn btn-primary">
+              Download True Stego (lossless)
+            </a>
+          </p>
+        {% endif %}
+
     </div>
 
     {% if result.download_url %}

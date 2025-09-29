@@ -878,9 +878,35 @@ def download_payload():
 _LAST_STEGO_VIDEO: bytes = b""
 _LAST_STEGO_METHOD: str = "iframe"
 
+def transcode_to_playable_mp4(in_path: str, out_path: str):
+    """
+    Make a browser-friendly MP4 preview (H.264 + yuv420p).
+    This WILL NOT preserve LSBs; preview-only.
+    """
+    cmd = [
+        "ffmpeg", "-y", "-i", in_path,
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+        "-pix_fmt", "yuv420p",
+        "-movflags", "+faststart",  # good for web playback
+        "-an",                      # keep video-only for preview; remove if you want audio
+        out_path
+    ]
+    subprocess.run(cmd, check=True)
+
+_LAST_ORIG_VIDEO: bytes = b""
+_LAST_STEGO_VIDEO_PREVIEW_MP4: bytes = b""
+
+def write_bytes(path: str, data: bytes):
+    with open(path, "wb") as f:
+        f.write(data)
+
+
 @app.post("/embed_video")
 def embed_video():
     global _LAST_STEGO_VIDEO, _LAST_STEGO_METHOD
+    # ADD THESE:
+    global _LAST_ORIG_VIDEO, _LAST_STEGO_VIDEO_PREVIEW_MP4
+
     try:
         cover = request.files.get("cover_video")
         payload = request.files.get("payload_video")
@@ -922,19 +948,38 @@ def embed_video():
             if method == "iframe":
                 # ---- Video I-frame stego ----
                 flat, meta, frames = load_video_from_file(input_mp4)
+
                 cap_bits = video_capacity_bits(flat.size, n_lsb)
                 if all_bits.size > cap_bits:
                     flash("Payload too large for video (I-frame).")
                     return redirect(url_for("index"))
 
                 flat_mut = embed_bits_into_bytes(flat.copy(), all_bits, n_lsb, key)
-                stego_bytes = save_video_to_bytes(flat_mut, meta)
+
+                # Save lossless stego with whatever container/codec the helper returns
+                stego_lossless_path = os.path.join(tmpdir, "stego_lossless.mkv")
+                stego_bytes_lossless = save_video_to_bytes(flat_mut, meta)  # <-- no kwargs
+                write_bytes(stego_lossless_path, stego_bytes_lossless)
+
+                # Make a browser-playable MP4 preview
+                preview_mp4_path = os.path.join(tmpdir, "stego_preview.mp4")
+                transcode_to_playable_mp4(stego_lossless_path, preview_mp4_path)
+
+                with open(preview_mp4_path, "rb") as f:
+                    _LAST_STEGO_VIDEO_PREVIEW_MP4 = f.read()
+
+                # Canonical (lossless) for download/extraction
+                stego_bytes = stego_bytes_lossless
+
+                # Keep original for side-by-side preview
+                with open(input_mp4, "rb") as f:
+                    _LAST_ORIG_VIDEO = f.read()
 
             else:
-                # ---- Audio-track stego ----
+                # ---- Audio-track stego (unchanged) ----
                 wav_in = os.path.join(tmpdir, "audio_in.wav")
                 wav_out = os.path.join(tmpdir, "audio_out.wav")
-                mov_out = os.path.join(tmpdir, "stego_audio.mov")  # stay consistent
+                mov_out = os.path.join(tmpdir, "stego_audio.mov")
 
                 extract_audio_from_mp4(input_mp4, wav_in)
 
@@ -949,19 +994,37 @@ def embed_video():
                 with open(wav_out, "wb") as f:
                     f.write(stego_wav)
 
-                # Mux back into MOV (PCM-safe)
                 replace_audio_in_mp4(input_mp4, wav_out, mov_out)
                 with open(mov_out, "rb") as f:
                     stego_bytes = f.read()
 
         _LAST_STEGO_VIDEO = stego_bytes
         _LAST_STEGO_METHOD = method
-        result = {"download_video_url": url_for("download_stego_video")}
+
+        result = {
+            "download_video_url": url_for("download_stego_video"),
+            "orig_stream_url": url_for("stream_original_video"),
+            "stego_stream_url": url_for("stream_stego_preview")
+        }
         return render_template("index.html", result=result)
 
     except Exception as e:
         flash(f"Embed Video error: {e}")
         return redirect(url_for("index"))
+
+@app.get("/stream/original_video")
+def stream_original_video():
+    if not _LAST_ORIG_VIDEO:
+        return redirect(url_for("index"))
+    # assume it's mp4
+    return send_file(io.BytesIO(_LAST_ORIG_VIDEO), mimetype="video/mp4")
+
+@app.get("/stream/stego_preview")
+def stream_stego_preview():
+    if not _LAST_STEGO_VIDEO_PREVIEW_MP4:
+        return redirect(url_for("index"))
+    return send_file(io.BytesIO(_LAST_STEGO_VIDEO_PREVIEW_MP4), mimetype="video/mp4")
+
 
 @app.get("/download/stego_video")
 def download_stego_video():
@@ -969,9 +1032,10 @@ def download_stego_video():
         return redirect(url_for("index"))
 
     if _LAST_STEGO_METHOD == "iframe":
-        filename = "stego_iframe.mp4"
-        mimetype = "video/mp4"
-    else:  # audio
+        # true, lossless stego for extraction
+        filename = "stego_iframe_lossless.mkv"
+        mimetype = "video/x-matroska"
+    else:
         filename = "stego_audio.mov"
         mimetype = "video/quicktime"
 
@@ -981,8 +1045,6 @@ def download_stego_video():
         download_name=filename,
         mimetype=mimetype
     )
-
-
 
 @app.post("/extract_video")
 def extract_video():
@@ -998,10 +1060,12 @@ def extract_video():
             return redirect(url_for("index"))
 
         with tempfile.TemporaryDirectory() as tmpdir:
+            # Ensure that both .mp4 and .mkv are supported for extraction
             ext = os.path.splitext(stego.filename or "")[1].lower()
-            if ext not in [".mp4", ".mov"]:
-                ext = ".mp4"
-            input_video = os.path.join(tmpdir, "stego" + ext)
+            if ext not in [".mp4", ".mov", ".mkv"]:
+                ext = ".mp4"  # Default to MP4 if extension is unsupported
+            
+            input_video = os.path.join(tmpdir, f"stego{ext}")
             stego.save(input_video)
 
             if method == "iframe":
