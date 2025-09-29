@@ -735,5 +735,414 @@
       });
     })();
   </script>
+  <script>
+/* ========= One script: file name+size + capacity previews ========= */
+
+(function () {
+  // ---- Constants from your secure header/AES-GCM ----
+  const FIXED_LEN = 96;   // header fixed bytes
+  const TAG_LEN   = 16;   // AES-GCM tag bytes
+
+  // ---- Helpers ----
+  function formatBytes(bytes) {
+    if (!Number.isFinite(bytes)) return "";
+    if (bytes === 0) return "0 Bytes";
+    const k = 1024;
+    const sizes = ["Bytes", "KB", "MB", "GB", "TB"];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    const val = bytes / Math.pow(k, i);
+    return (i === 0 ? Math.round(val) : val.toFixed(2)) + " " + sizes[i];
+  }
+  const enc = new TextEncoder();
+  const textByteLen = (s) => enc.encode(s || "").length;
+
+  // Make/return a small info line under a drop-zone
+  function ensureInfoLine(zone) {
+    if (!zone) return null;
+    let info = zone.querySelector(".file-extra");
+    if (!info) {
+      info = document.createElement("div");
+      info.className = "file-extra note";
+      info.style.marginTop = "4px";
+      zone.appendChild(info);
+    }
+    return info;
+  }
+
+  // Update .file-name inside each drop-zone to include file size
+  function wireNameAndSize(zone) {
+    const input = zone.querySelector('input[type="file"]');
+    const nameEl = zone.querySelector(".file-name");
+    if (!input || !nameEl) return;
+
+    function update() {
+      if (input.files && input.files.length) {
+        const f = input.files[0];
+        nameEl.textContent = `${f.name} (${formatBytes(f.size)})`;
+      } else {
+        nameEl.textContent = "";
+      }
+    }
+    input.addEventListener("change", update);
+    // In case an earlier script already set files and dispatched change
+    update();
+  }
+
+  // Wire name+size for ALL drop-zones (works with your existing DnD script)
+  document.querySelectorAll(".drop-zone").forEach(wireNameAndSize);
+
+  // ---------- IMAGE (Embed) capacity preview ----------
+  (function wireImageCapacity() {
+    const form = document.querySelector('form[action$="embed"]');
+    if (!form) return;
+
+    const payloadFileInput = form.querySelector("#payload");
+    const textInput        = form.querySelector("#text_input");
+    const coverInput       = form.querySelector('input[name="cover"]');
+    const lsbInput         = form.querySelector('input[name="lsb"]');
+
+    const payloadZone = payloadFileInput?.closest(".drop-zone");
+    const coverZone   = coverInput?.closest(".drop-zone");
+    const payloadInfo = ensureInfoLine(payloadZone);
+    const coverInfo   = ensureInfoLine(coverZone);
+
+    function currentPayload() {
+      if (payloadFileInput?.files?.length) {
+        const f = payloadFileInput.files[0];
+        return { name: f.name || "payload.bin", size: f.size, kind: "file" };
+      }
+      const t = (textInput?.value || "").trim();
+      if (t.length) {
+        return { name: "text_payload.txt", size: textByteLen(t), kind: "text" };
+      }
+      return null;
+    }
+
+    function requiredBytesFor(payloadName, payloadLenBytes) {
+      const nlen = textByteLen(payloadName || "");
+      const headerBytes = FIXED_LEN + nlen;
+      const cipherBytes = payloadLenBytes + TAG_LEN;
+      return headerBytes + cipherBytes;
+    }
+
+    function getImageNatDims() {
+      // Your ROI image loader fills these on cover choose
+      const w = parseInt(document.getElementById("nat_w")?.value || "0", 10);
+      const h = parseInt(document.getElementById("nat_h")?.value || "0", 10);
+      return (w > 0 && h > 0) ? { W: w, H: h } : null;
+    }
+
+    function imageCapacityBytes(W, H, nLsb, channels = 3) {
+      // capacity = pixels * channels * nLsb / 8
+      const capBits = BigInt(W) * BigInt(H) * BigInt(channels) * BigInt(nLsb);
+      return Number(capBits / 8n);
+    }
+
+    function minPixelsFor(requiredBytes, nLsb, channels = 3) {
+      // ceil( requiredBytes*8 / (channels*nLsb) )
+      const num = BigInt(requiredBytes) * 8n;
+      const den = BigInt(channels) * BigInt(nLsb);
+      return Number((num + den - 1n) / den);
+    }
+
+    function squareSuggestion(nPixels) {
+      const s = Math.ceil(Math.sqrt(nPixels));
+      return `${s}×${s}`;
+    }
+
+    function recompute() {
+      const nLsb = Math.max(1, Math.min(8, parseInt(lsbInput?.value || "1", 10)));
+      const payload = currentPayload();
+
+      // Payload info line
+      if (payloadInfo) {
+        if (!payload) {
+          payloadInfo.textContent = "";
+        } else {
+          const req = requiredBytesFor(payload.name, payload.size);
+          const minPix = minPixelsFor(req, nLsb, 3);
+          payloadInfo.textContent =
+            `Selected: ${payload.name} (${formatBytes(payload.size)}). ` +
+            `Needs cover file ≥ ${formatBytes(req)} capacity ` +
+            `(min ~ ${minPix.toLocaleString()} px @ ${nLsb} LSBs, ≈ ${squareSuggestion(minPix)}).`;
+        }
+      }
+
+      // Cover capacity line (if cover chosen and nat dims known)
+      if (coverInfo) {
+        const dims = getImageNatDims();
+        if (!dims) {
+          coverInfo.textContent = "";
+        } else {
+          const cap = imageCapacityBytes(dims.W, dims.H, nLsb, 3);
+          if (payload) {
+            const req = requiredBytesFor(payload.name, payload.size);
+            const status = (cap >= req) ? "OK" : "Too small";
+            coverInfo.textContent =
+              `Cover ≈ ${dims.W}×${dims.H} @ ${nLsb} LSBs → capacity ${formatBytes(cap)} (${status}).`;
+          } else {
+            coverInfo.textContent =
+              `Cover ≈ ${dims.W}×${dims.H} @ ${nLsb} LSBs → capacity ${formatBytes(cap)}.`;
+          }
+        }
+      }
+    }
+
+    // Events
+    payloadFileInput?.addEventListener("change", recompute);
+    textInput?.addEventListener("input", recompute);
+    lsbInput?.addEventListener("input", recompute);
+    lsbInput?.addEventListener("change", recompute);
+
+    // When cover changes, your ROI loader fills nat_w/nat_h on load—recompute after a tick
+    coverInput?.addEventListener("change", () => setTimeout(recompute, 0));
+
+    recompute();
+  })();
+
+  // ---------- AUDIO: show payload size + required bytes ----------
+  function wireSimpleRequired(formSelector, payloadSelector) {
+    const form = document.querySelector(formSelector);
+    if (!form) return;
+    const payload = form.querySelector(payloadSelector);
+    const zone = payload?.closest(".drop-zone");
+    const info = ensureInfoLine(zone);
+
+    function recompute() {
+      if (!payload || !info) return;
+      if (payload.files && payload.files.length) {
+        const f = payload.files[0];
+        const req = (FIXED_LEN + textByteLen(f.name || "")) + (f.size + TAG_LEN);
+        info.textContent =
+          `Selected: ${f.name} (${formatBytes(f.size)}). ` +
+          `Needs cover capacity ≥ ${formatBytes(req)}.`;
+      } else {
+        info.textContent = "";
+      }
+    }
+    payload?.addEventListener("change", recompute);
+    recompute();
+  }
+
+  wireSimpleRequired('form[action$="embed_video"]', 'input[name="payload_video"]');
+})();
+</script>
+<script>
+/* ---------- AUDIO (WAV): capacity with ROI + min duration hint ---------- */
+(function () {
+  const FIXED_LEN = 96;   // header fixed bytes (same as backend)
+  const TAG_LEN   = 16;   // AES-GCM tag
+
+  // Reuse helpers from your main script if present; fallback versions here:
+  const enc = window.TextEncoder ? new TextEncoder() : null;
+  const textByteLen = (s) => enc ? enc.encode(s || "").length : (s || "").length;
+  function formatBytes(bytes) {
+    if (!Number.isFinite(bytes)) return "";
+    if (bytes === 0) return "0 Bytes";
+    const k = 1024, sizes = ["Bytes","KB","MB","GB","TB"];
+    const i = Math.floor(Math.log(bytes)/Math.log(k));
+    const v = bytes/Math.pow(k,i);
+    return (i===0 ? Math.round(v) : v.toFixed(2))+" "+sizes[i];
+  }
+
+  // Make/return a small info line under a drop-zone
+  function ensureInfoLine(zone) {
+    if (!zone) return null;
+    let info = zone.querySelector(".file-extra");
+    if (!info) {
+      info = document.createElement("div");
+      info.className = "file-extra note";
+      info.style.marginTop = "4px";
+      zone.appendChild(info);
+    }
+    return info;
+  }
+
+  // Parse WAV header (RIFF) just enough to get byteRate & blockAlign.
+  // Works for standard PCM WAV.
+  function readWavHeader(file) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      // Read first 128 bytes (more than enough for RIFF + "fmt " chunk).
+      const blob = file.slice(0, 128);
+      reader.onload = () => {
+        try {
+          const buf = reader.result;
+          const dv  = new DataView(buf);
+
+          // "RIFF" (0-3), "WAVE" (8-11)
+          if (dv.getUint32(0, false) !== 0x52494646 || dv.getUint32(8, false) !== 0x57415645) {
+            throw new Error("Not a RIFF/WAVE file");
+          }
+
+          // Find the "fmt " chunk
+          let off = 12;
+          let byteRate = null;
+          let blockAlign = null;
+          while (off + 8 <= dv.byteLength) {
+            const chunkId = dv.getUint32(off, false);
+            const chunkSz = dv.getUint32(off + 4, true);
+            off += 8;
+            if (chunkId === 0x666d7420) { // "fmt "
+              // audioFormat(2), numChannels(2), sampleRate(4), byteRate(4), blockAlign(2), bitsPerSample(2)
+              const audioFormat = dv.getUint16(off, true);
+              const numChannels = dv.getUint16(off + 2, true);
+              const sampleRate  = dv.getUint32(off + 4, true);
+              byteRate   = dv.getUint32(off + 8, true);
+              blockAlign = dv.getUint16(off + 12, true);
+              // basic sanity
+              if (audioFormat !== 1 && audioFormat !== 65534) {
+                // 1=PCM, 65534=WAVE_FORMAT_EXTENSIBLE (often PCM too)
+              }
+              break;
+            } else {
+              off += chunkSz;
+            }
+          }
+          if (!byteRate || !blockAlign) throw new Error("fmt chunk not found");
+          resolve({ byteRate, blockAlign });
+        } catch (e) { reject(e); }
+      };
+      reader.onerror = () => reject(reader.error);
+      reader.readAsArrayBuffer(blob);
+    });
+  }
+
+  function requiredBytesFor(name, payloadLenBytes) {
+    const nlen = textByteLen(name || "");
+    const headerBytes = FIXED_LEN + nlen;
+    const cipherBytes = payloadLenBytes + TAG_LEN;
+    // For audio, your backend embeds HEADER+PAYLOAD together in the ROI.
+    return headerBytes + cipherBytes;
+  }
+
+  const form = document.querySelector('form[action$="embed_audio"]');
+  if (!form) return;
+
+  const coverInput   = form.querySelector('input[name="cover_wav"]');
+  const payloadInput = form.querySelector('input[name="payload_wav"]');
+  const lsbInput     = form.querySelector('input[name="lsb"]');
+  const startEl      = form.querySelector('#start_time');
+  const endEl        = form.querySelector('#end_time');
+
+  const coverZone   = coverInput?.closest(".drop-zone");
+  const payloadZone = payloadInput?.closest(".drop-zone");
+  const coverInfo   = ensureInfoLine(coverZone);
+  const payloadInfo = ensureInfoLine(payloadZone);
+
+  let wavMeta = null; // {byteRate, blockAlign}
+  let audioDuration = null;
+
+  // Try to read duration from the <audio id="roiAudio"> element you already have
+  const audioEl = document.getElementById('roiAudio');
+  if (audioEl) {
+    audioEl.addEventListener('loadedmetadata', () => {
+      audioDuration = audioEl.duration || null;
+      recompute();
+    });
+  }
+
+  function currentPayload() {
+    if (payloadInput?.files?.length) {
+      const f = payloadInput.files[0];
+      return { name: f.name || 'payload.bin', size: f.size };
+    }
+    return null;
+  }
+
+  function roiSeconds() {
+    const st = parseFloat(startEl?.value || ""); 
+    const et = parseFloat(endEl?.value   || "");
+    if (!Number.isFinite(st) || !Number.isFinite(et)) {
+      // No ROI → use entire audio duration if known
+      return audioDuration || null;
+    }
+    return Math.max(0, et - st);
+  }
+
+  async function recompute() {
+    if (!coverInput?.files?.length) {
+      coverInfo && (coverInfo.textContent = "");
+      payloadInfo && (payloadInfo.textContent = "");
+      return;
+    }
+    const nLsb = Math.max(1, Math.min(8, parseInt(lsbInput?.value || "1", 10)));
+    const payload = currentPayload();
+
+    // Show payload requirement line
+    if (payloadInfo) {
+      if (!payload) {
+        payloadInfo.textContent = "";
+      } else {
+        const req = requiredBytesFor(payload.name, payload.size);
+        payloadInfo.textContent =
+          `Selected: ${payload.name} (${formatBytes(payload.size)}). ` +
+          `Needs ≥ ${formatBytes(req)} capacity.`;
+      }
+    }
+
+    // Need byteRate to compute capacity from seconds
+    if (!wavMeta) {
+      try {
+        wavMeta = await readWavHeader(coverInput.files[0]);
+      } catch {
+        coverInfo && (coverInfo.textContent = "Unable to read WAV header for capacity preview.");
+        return;
+      }
+    }
+    const { byteRate, blockAlign } = wavMeta;
+
+    // Determine region seconds (ROI or full)
+    const sec = roiSeconds();
+    if (sec == null) {
+      coverInfo && (coverInfo.textContent = "Pick ROI start/end (or load the audio so duration is known).");
+      return;
+    }
+
+    // Convert seconds → bytes (aligned like backend)
+    let startByte = 0, endByte = Math.floor(sec * byteRate);
+    // If explicit ROI is set, we align both ends in backend; we just mimic capacity roughly here.
+    // Capacity (BYTES) in ROI = floor( roi_bytes * nLsb / 8 )
+    const roiBytes = Math.max(0, endByte - startByte);
+    const roiCapBytes = Math.floor((roiBytes * nLsb) / 8);
+
+    if (!coverInfo) return;
+
+    if (!payload) {
+      coverInfo.textContent =
+        `Region: ${sec.toFixed(2)}s @ ${nLsb} LSBs → capacity ${formatBytes(roiCapBytes)}.`;
+      return;
+    }
+
+    const reqBytes = requiredBytesFor(payload.name, payload.size);
+    if (roiCapBytes >= reqBytes) {
+      coverInfo.textContent =
+        `Region: ${sec.toFixed(2)}s @ ${nLsb} LSBs → capacity ${formatBytes(roiCapBytes)} (OK).`;
+    } else {
+      const needSec = reqBytes * 8 / (byteRate * nLsb); // invert: req = byteRate*sec*nLsb/8
+      coverInfo.textContent =
+        `Region: ${sec.toFixed(2)}s @ ${nLsb} LSBs → capacity ${formatBytes(roiCapBytes)} (Too small). ` +
+        `Needs ≥ ${needSec.toFixed(2)}s at ${nLsb} LSBs.`;
+    }
+  }
+
+  // Wire events
+  [coverInput, payloadInput, lsbInput, startEl, endEl].forEach(el => {
+    el?.addEventListener("change", recompute);
+    el?.addEventListener("input",  recompute);
+  });
+
+  // When a new cover WAV is chosen, reset parsed header and kick off recompute
+  coverInput?.addEventListener("change", () => {
+    wavMeta = null;
+    setTimeout(recompute, 0);
+  });
+
+  // Initial
+  recompute();
+})();
+</script>
+
+
 </body>
 </html>
