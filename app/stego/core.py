@@ -21,8 +21,16 @@ def bits_to_bytes(bits: np.ndarray) -> bytes:
     return np.packbits(bits.astype(np.uint8)).tobytes()
 
 def prng_perm(total_slots: int, key: int) -> np.ndarray:
-    rng = np.random.default_rng(seed=int(key) & 0xFFFFFFFF)
-    return rng.permutation(total_slots)
+    """
+    Deterministic permutation for a given length and integer key.
+    - No global RNG state
+    - Stable across processes/platforms
+    - Works for any positive/negative key
+    """
+    # Normalize the key into an unsigned 64-bit seed (avoid sign/overflow quirks)
+    seed = np.uint64(key & 0xFFFFFFFFFFFFFFFF)
+    rng = np.random.default_rng(seed)      # local generator (doesn't touch global state)
+    return rng.permutation(total_slots).astype(np.int64)
 
 def safe_download_name_and_mime(ext: str):
     mime = "application/octet-stream"

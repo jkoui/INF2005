@@ -25,7 +25,12 @@ from stego.core import (
     build_secure_header, parse_secure_header, FIXED_LEN
 )
 
-from stego.lsb import embed_bits_into_bytes, extract_bits_from_bytes
+from stego.lsb import (
+    embed_bits_into_bytes,
+    extract_bits_from_bytes,
+    LOC_LEN, build_locator, parse_locator,
+    write_bits_sequential, read_bits_sequential, embed_bits_into_bytes_seq, extract_bits_from_bytes_seq
+)
 
 from stego.media import (
     load_image_from_file, save_image_to_bytes, image_capacity_bits,
@@ -124,6 +129,10 @@ def parse_roi(form, img_w_actual: int, img_h_actual: int, is_audio: bool = False
 _LAST_STEGO: bytes = b""
 _LAST_STEGO_WAV: bytes = b""
 _LAST_PAYLOAD: Tuple[bytes, str] = (b"", "recovered.bin")
+
+def _hex(b: bytes, n: int = None) -> str:
+    return (b if n is None else b[:n]).hex()
+
 
 @app.get("/")
 def index():
@@ -485,15 +494,13 @@ def embed_audio():
         payload_bytes = payload.read()
         orig_name = os.path.basename(payload.filename or "payload.bin")
 
+        # --- crypto
         salt = _os.urandom(SALT_LEN)
         key_bytes = derive_key(int(key), salt)
         nonce, ciphertext_with_tag = encrypt_aes_gcm(key_bytes, payload_bytes, aad=None)
         plain_sha = sha256(payload_bytes)
 
-        # Parse ROI for audio (start_time and end_time)
-        region, _, _, sel_w, _ = parse_roi(request.form, 0, 0, is_audio=True)
-
-        # WAV loading
+        # --- load WAV as raw bytes (carrier space)
         cover.stream.seek(0)
         flat_bytes, wav_params, _ = load_wav_from_file(cover)
         fr = wav_params["framerate"]
@@ -503,97 +510,132 @@ def embed_audio():
         byte_rate = fr * frame_size
         total_bytes = flat_bytes.size
 
-        # --- Compute ROI start/end in BYTES from ROI seconds (if any)
-        start_byte, end_byte = 0, total_bytes       
+        # --- Parse ROI (seconds) -> bytes (clamped)
+        region, _, _, sel_w, _ = parse_roi(request.form, 0, 0, is_audio=True)
+
+        start_byte_raw, end_byte_raw = 0, total_bytes
         if region:
             st = float(region["start_time"])
             et = float(region["end_time"])
-            start_byte = int(max(0, min(total_bytes, st * byte_rate)))
-            end_byte   = int(max(0, min(total_bytes, et * byte_rate)))
-            if end_byte <= start_byte:
+            start_byte_raw = int(max(0, min(total_bytes, st * byte_rate)))
+            end_byte_raw   = int(max(0, min(total_bytes, et * byte_rate)))
+            if end_byte_raw <= start_byte_raw:
                 flash("Invalid audio ROI after clamping. Please choose a larger time range.")
                 return redirect(url_for("index"))
 
-        # --- Align ROI to frame boundaries
+            # align to frame boundaries
+            start_byte_raw = (start_byte_raw // frame_size) * frame_size
+            end_byte_raw   = (end_byte_raw   // frame_size) * frame_size
+            end_byte_raw   = max(end_byte_raw, start_byte_raw + frame_size)
+
+        # How many carrier BYTES are needed to store the LOC_LEN-bytes locator at n_lsb bits/byte?
+        LOC_GUARD_BYTES = (LOC_LEN * 8 + n_lsb - 1) // n_lsb  # ceil(LOC_LEN*8 / n_lsb)
+
+        # --- Decide actual embed span (avoid clobbering locator at file start)
+        # Locator lives at the very start of the file. If no ROI, we shift embed start past locator.
+        # --- Decide actual embed span and avoid clobbering the locator prefix ---
         if region:
-            start_byte = (start_byte // frame_size) * frame_size
-            end_byte   = (end_byte   // frame_size) * frame_size
-            end_byte   = max(end_byte, start_byte + frame_size)  # ensure >= 1 frame
+            raw_start = start_byte_raw
+            raw_end   = end_byte_raw
         else:
-            start_byte, end_byte = 0, total_bytes
+            raw_start = 0
+            raw_end   = total_bytes
 
-        roi_len_bytes = end_byte - start_byte
+        # Always reserve the locator prefix at the beginning of the stream
+        reserve = LOC_GUARD_BYTES  # depends on n_lsb
+        embed_start = max(raw_start, reserve)
+        embed_end   = raw_end
 
-        # --- Build header only once (with aligned ROI)
+        if embed_end <= embed_start:
+            flash("Selected region is too early/small and collides with the locator prefix. Please choose a later/larger ROI.")
+            return redirect(url_for("index"))
+
+        if not (0 <= embed_start < embed_end <= total_bytes):
+            flash("Invalid embedding span.")
+            return redirect(url_for("index"))
+
+        embed_len_bytes = embed_end - embed_start
+        flash(f"[DBG-EMBED] embed_start={embed_start}, embed_end={embed_end}, len={embed_len_bytes}, n_lsb={n_lsb}")
+
+
+        # --- Build secure header (records the true embedding offsets)
         header = build_secure_header(
             plain_len=len(payload_bytes),
             filename=orig_name,
             lsb_used=n_lsb,
-            start_offset=start_byte,          # where embedding begins
+            start_offset=embed_start,
             nonce=nonce,
             salt=salt,
             sha256_bytes=plain_sha,
-            roi_x1=start_byte, roi_y1=0,
-            roi_x2=end_byte,   roi_y2=roi_len_bytes,
+            roi_x1=embed_start, roi_y1=0,
+            roi_x2=embed_end,   roi_y2=embed_len_bytes,
         )
 
-        # Bits to embed
+        flash(f"[DBG-EMBED] header_magic={_hex(MAGIC)}, header_len={len(header)}")
+
         blob = header + ciphertext_with_tag
         data_bits = bytes_to_bits(blob)
         header_bytes_len = len(header)
         required_bytes = header_bytes_len + len(ciphertext_with_tag)
 
-        # --- Capacity check should use ROI capacity (not full file)
-        cap_bits = wav_capacity_bits(roi_len_bytes if region else total_bytes, n_lsb)
+        # --- Capacity check over the actual slice
+        cap_bits = wav_capacity_bits(embed_len_bytes, n_lsb)
         cap_bytes = cap_bits // 8
         if data_bits.size > cap_bits:
             where = "selected region" if region else "WAV"
             flash(f"{where} too small. Capacity={cap_bytes} bytes, Needed={required_bytes} bytes")
             return redirect(url_for("index"))
 
-        # --- Embed ONLY inside the ROI
-        if region:
-            stego_flat = flat_bytes.copy()
-            roi_cover = flat_bytes[start_byte:end_byte]
-            roi_stego = embed_bits_into_bytes(roi_cover, data_bits, n_lsb, key)
-            stego_flat[start_byte:end_byte] = roi_stego
-        else:
-            stego_flat = embed_bits_into_bytes(flat_bytes, data_bits, n_lsb, key)
+        # --- Embed inside [embed_start:embed_end] with PRNG over that slice
+        stego_flat = flat_bytes.copy()
+        slice_cover = flat_bytes[embed_start:embed_end]
+        # slice_stego = embed_bits_into_bytes_seq(slice_cover, data_bits, n_lsb)
+        slice_stego = embed_bits_into_bytes(slice_cover, data_bits, n_lsb, key)
+        stego_flat[embed_start:embed_end] = slice_stego
+
+        # --- Immediately read back from the same slice using PRNG (must start with '41435731' = 'ACW1')
+        test_slice = stego_flat[embed_start:embed_end]
+        perm_len   = test_slice.size * n_lsb
+        from stego.core import prng_perm  # ensure this is your new deterministic version
+        perm_head  = prng_perm(perm_len, key)[:16]  # 16 *bit slots* (not bytes)
+
+        peek_bits_embed = extract_bits_from_bytes(test_slice, n_lsb, key, 16*8)
+        peek_bytes_embed = bits_to_bytes(peek_bits_embed)
+        flash(f"[DBG-EMBED] prng_first_slots={perm_head[:8]} ...")
+        flash(f"[DBG-EMBED] prng_peek_first16={peek_bytes_embed[:16].hex()}")
 
 
-        cap_bytes = cap_bits // 8
-        if data_bits.size > cap_bits:
-            where = "selected region" if region else "WAV"
-            flash(f"{where} too small. Capacity={cap_bytes} bytes, Needed={required_bytes} bytes")
-            return redirect(url_for("index"))
+        # --- Write tiny locator prefix sequentially at file start
+        loc_bytes = build_locator(embed_start, embed_end)
+        loc_bits  = bytes_to_bits(loc_bytes)
+        write_bits_sequential(stego_flat, n_lsb, loc_bits, start_byte=0)
+        flash(f"[DBG-EMBED] locator bytes={LOC_LEN}, guard_bytes={ (LOC_LEN*8 + n_lsb - 1)//n_lsb }")
 
+        # --- Save WAV
         stego_wav = save_wav_to_bytes(stego_flat, wav_params)
         _LAST_STEGO_WAV = stego_wav
 
-        # ---- Waveform previews ----
+        # ---- Previews & stats (highlight the real embed span)
         mono_cover = decode_mono(flat_bytes, wav_params)
         mono_stego = decode_mono(stego_flat,  wav_params)
 
-        # ROI ms (for highlight band)
-        roi_start_ms = 1000.0 * start_byte / byte_rate
-        roi_end_ms   = 1000.0 * end_byte   / byte_rate
+        roi_start_ms = 1000.0 * embed_start / byte_rate
+        roi_end_ms   = 1000.0 * embed_end   / byte_rate
 
-        # FULL overview (whole file) stacked:
         full_img = waveform_compare_stacked(
             mono_cover, mono_stego,
             framerate=fr,
-            start_sample=0, num_samples=None,   # entire file
+            start_sample=0, num_samples=None,
             width=1100, lane_h=180, lane_gap=28,
             show_diff=True, diff_gain=2.0,
-            highlight_ms=(roi_start_ms, roi_end_ms) if region else None
+            highlight_ms=(roi_start_ms, roi_end_ms)
         )
         waveform_full_preview = img_to_data_url(full_img)
 
-        # ZOOM: exact user ROI (or 150 ms center if none)
-        if region:
-            start_sample = start_byte // (sw * nc)
-            num_samples  = max(1, (end_byte - start_byte) // (sw * nc))
-        else:
+        # zoom region: actual embed span (or 150ms mid if somehow tiny)
+        start_sample = embed_start // (sw * nc)
+        num_samples  = max(1, (embed_end - embed_start) // (sw * nc))
+        if num_samples <= 1:
             center = mono_cover.size // 2
             num_samples = max(1, int(fr * 0.150))
             start_sample = max(0, center - num_samples // 2)
@@ -608,7 +650,6 @@ def embed_audio():
         )
         waveform_zoom_preview = img_to_data_url(zoom_img)
 
-        # Previews + stats
         cover_audio_preview = audio_to_data_url(save_wav_to_bytes(flat_bytes, wav_params))
         stego_audio_preview = audio_to_data_url(stego_wav)
         fmt = f"{wav_params['nchannels']} ch, {8*wav_params['sampwidth']}-bit, {wav_params['framerate']} Hz, {wav_params['nframes']} frames"
@@ -625,10 +666,9 @@ def embed_audio():
             "n_lsb": n_lsb,
             "hw": None,
             "wav_fmt": fmt,
-            "roi_time": f"{roi_start_ms/1000:.3f}s – {roi_end_ms/1000:.3f}s" if region else None,
-            "roi_bytes": roi_len_bytes if region else None,
+            "roi_time": f"{roi_start_ms/1000:.3f}s – {roi_end_ms/1000:.3f}s",
+            "roi_bytes": embed_len_bytes,
         }
-
 
         result = {
             "cover_audio_preview": cover_audio_preview,
@@ -658,40 +698,67 @@ def extract_audio():
     try:
         stego = request.files.get("stego_wav")
         n_lsb = int(request.form.get("lsb", "1"))
-        key = int(request.form.get("key", "0"))
+        key   = int(request.form.get("key", "0"))
         if not stego:
             flash("Please provide a stego WAV.")
             return redirect(url_for("index"))
 
         stego.stream.seek(0)
         flat_bytes, wav_params, _ = load_wav_from_file(stego)
+        total_bytes = flat_bytes.size
 
-        # Reader function for header parse
+        # --- 0) Read locator prefix (sequential; no PRNG)
+        loc_bits_needed = LOC_LEN * 8
+        loc_bits = read_bits_sequential(flat_bytes, n_lsb, loc_bits_needed, start_byte=0)
+        loc_bytes = bits_to_bytes(loc_bits)
+        embed_start, embed_end = parse_locator(loc_bytes)
+        flash(f"[DBG-EXTRACT] locator embed_start={embed_start}, embed_end={embed_end}, total_bytes={total_bytes}, n_lsb={n_lsb}")
+
+
+        if not (0 <= embed_start < embed_end <= total_bytes):
+            raise ValueError("Invalid locator offsets.")
+
+        slice_bytes = flat_bytes[embed_start:embed_end]
+
+        perm_len   = slice_bytes.size * n_lsb
+        from stego.core import prng_perm
+        perm_head  = prng_perm(perm_len, key)[:16]
+        flash(f"[DBG-EXTRACT] prng_first_slots={perm_head[:8]} ...")
+
+
+        # Reader that operates over the SAME slice/permutation as embed
         def read_bits(nbits):
-            return extract_bits_from_bytes(flat_bytes, n_lsb, key, nbits)
+            return extract_bits_from_bytes(slice_bytes, n_lsb, key, nbits)
+        
+        # Peek first 16 bytes (128 bits) via the PRNG over the SAME SLICE
+        peek_bits = extract_bits_from_bytes(slice_bytes, n_lsb, key, 16*8)
+        peek_bytes = bits_to_bytes(peek_bits)
+        flash(f"[DBG-EXTRACT] first16={_hex(peek_bytes, 16)}")
 
         # 1) Parse secure header
         hdr, header_bits = parse_secure_header(read_bits)
 
-        # 2) Ciphertext length = plaintext length + tag
+        flash(f"[DBG-EXTRACT] parsed header_bits={header_bits}, hdr.start_offset={hdr.start_offset}, hdr.lsb_used={hdr.lsb_used}")
+        flash(f"[DBG-EXTRACT] hdr.name_len={len(hdr.name or b'') if hasattr(hdr,'name') else 'n/a'}")
+
+
+        # 2) Ciphertext length (plaintext + tag)
         cipher_len = hdr.plain_len + TAG_LEN
         total_bits = header_bits + cipher_len * 8
 
-        # 3) Extract full chunk, slice ciphertext
-        all_bits = extract_bits_from_bytes(flat_bytes, n_lsb, key, total_bits)
+        # 3) Extract header+ciphertext from the slice, then split
+        all_bits = extract_bits_from_bytes(slice_bytes, n_lsb, key, total_bits)
         all_bytes = bits_to_bytes(all_bits)
         header_bytes_len = header_bits // 8
         ciphertext_with_tag = all_bytes[header_bytes_len : header_bytes_len + cipher_len]
 
-        # 4) Decrypt
+        # 4) Decrypt and verify
         key_bytes = derive_key(int(key), hdr.salt)
         plaintext = decrypt_aes_gcm(key_bytes, hdr.nonce, ciphertext_with_tag, aad=None)
-
-        # 5) Verify SHA-256
         if sha256(plaintext) != hdr.sha256:
             raise ValueError("Integrity check failed (SHA-256 mismatch). Wrong key or corrupted data.")
 
-        # 6) Save as original name
+        # 5) Save using original name
         fname = secure_filename(hdr.name or "recovered.bin")
         if not os.path.splitext(fname)[1]:
             fname += ".bin"
