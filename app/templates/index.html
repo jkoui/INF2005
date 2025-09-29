@@ -390,9 +390,9 @@
 
       {% if result.audio_embed_lane_prng %}
         <div class="card preview">
-          <h3>Embedding Map (Audio · PRNG Plan)</h3>
+          <h3>Embedding Map (Audio · PRNG)</h3>
           <img class="wave" src="{{ result.audio_embed_lane_prng }}" alt="Embedding density (PRNG)">
-          <p class="muted">Darker bars = more writes per time slice.</p>
+          <p class="muted"></p>
         </div>
       {% endif %}
 
@@ -400,9 +400,24 @@
         <div class="card preview">
           <h3>Embedding Map (Audio · From Diff)</h3>
           <img class="wave" src="{{ result.audio_embed_lane_diff }}" alt="Embedding density (Diff)">
-          <p class="muted">Computed from cover vs stego differences; darker = more changed bytes.</p>
+          <p class="muted">Computed from cover vs stego differences; Taller bars = more changes.</p>
         </div>
       {% endif %}
+
+    {% if result.stego_chi_timeline or result.stego_bias_timeline %}
+      <div class="card preview">
+        <h3>Statistical Timelines (Stego)</h3>
+        {% if result.stego_chi_timeline %}
+          <h4 class="muted">Pairs-of-Values χ² (lower → more suspicious)</h4>
+          <img class="wave" src="{{ result.stego_chi_timeline }}" alt="χ² timeline">
+        {% endif %}
+        {% if result.stego_bias_timeline %}
+          <h4 class="muted">LSB Ones Ratio (→ 0.5 inside ROI)</h4>
+          <img class="wave" src="{{ result.stego_bias_timeline }}" alt="LSB ratio timeline">
+        {% endif %}
+      </div>
+    {% endif %}
+
 
       {% if result.capacity %}
         <div class="card" style="min-width:320px;">

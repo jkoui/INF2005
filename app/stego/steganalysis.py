@@ -341,3 +341,110 @@ def audio_embed_map_from_diff(
     drw.text((6, 6), "Embedding density (diff)", fill=(0,0,0))
     return img
 
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+
+# ---------- core stats ----------
+def lsb_bias(bytes_u8: np.ndarray):
+    bits = (bytes_u8 & 1).astype(np.uint8)
+    ones  = int(bits.sum())
+    total = int(bits.size)
+    zeros = total - ones
+    ratio = ones / max(1, total)
+    return zeros, ones, ratio, total
+
+def pov_chi_square(bytes_u8: np.ndarray) -> float:
+    cnt = np.bincount(bytes_u8.astype(np.uint8), minlength=256)
+    pairs = cnt.reshape(128, 2)
+    s = pairs.sum(axis=1).astype(np.float64)
+    d = (pairs[:,0] - pairs[:,1]).astype(np.float64)
+    s[s == 0] = 1.0
+    return float(np.sum((d*d) / s))
+
+def sliding_stat(bytes_u8: np.ndarray, win=50_000, hop=25_000, fn=lambda b: 0.0):
+    vals, idx = [], []
+    N = bytes_u8.size
+    if N < win:  # one window fallback
+        return [fn(bytes_u8)], [0]
+    for i in range(0, N - win + 1, hop):
+        vals.append(fn(bytes_u8[i:i+win]))
+        idx.append(i)
+    return vals, idx
+
+# ---------- tiny chart primitives ----------
+def _chart_bg(width, height, title=None):
+    img = Image.new("RGBA", (width, height), (255,255,255,255))
+    drw = ImageDraw.Draw(img)
+    # title
+    if title:
+        drw.text((8, 6), title, fill=(0,0,0,255))
+    # frame
+    drw.rectangle((0,0,width-1,height-1), outline=(220,220,220,255))
+    return img, drw
+
+def bar2(lsb_zeros, lsb_ones, width=420, height=180, title="LSB Histogram"):
+    img, drw = _chart_bg(width, height, title)
+    pad = 36
+    W = width - 2*pad
+    H = height - 2*pad
+    base = height - pad
+    m = max(1, lsb_zeros, lsb_ones)
+    w = W//6
+    x0 = pad + W//3 - w//2
+    x1 = pad + 2*W//3 - w//2
+    # axes
+    drw.line((pad, base, pad+W, base), fill=(200,200,200,255))
+    # bars (gray)
+    h0 = int(H * (lsb_zeros/m))
+    h1 = int(H * (lsb_ones/m))
+    drw.rectangle((x0, base-h0, x0+w, base), fill=(160,160,160,255))
+    drw.rectangle((x1, base-h1, x1+w, base), fill=(160,160,160,255))
+    # labels
+    drw.text((x0, base+4), "LSB=0", fill=(0,0,0,255))
+    drw.text((x1, base+4), "LSB=1", fill=(0,0,0,255))
+    return img
+
+def line_plot(values, width=640, height=180, title="Timeline"):
+    if not values:
+        return _chart_bg(width, height, title)[0]
+    img, drw = _chart_bg(width, height, title)
+    pad = 26
+    W = width - 2*pad
+    H = height - 2*pad
+    base = height - pad
+    v = np.array(values, dtype=np.float64)
+    lo, hi = np.percentile(v, [5,95])
+    if hi <= lo:
+        lo, hi = float(v.min()), float(v.max()+1e-9)
+    # normalize 0..1 (invert if you want low → “higher” visually; here we keep natural)
+    vn = (v - lo) / (hi - lo + 1e-12)
+    # polyline
+    prev = None
+    for i, y in enumerate(vn):
+        x = pad + int(i * (W / max(1, len(vn)-1)))
+        ypix = base - int(y * H)
+        if prev:
+            drw.line((*prev, x, ypix), fill=(80,80,80,255), width=2)
+        prev = (x, ypix)
+    # x-axis
+    drw.line((pad, base, pad+W, base), fill=(200,200,200,255))
+    return img
+
+# ---------- convenience wrappers for WAV bytes ----------
+def wav_stats_and_charts(raw_bytes_u8: np.ndarray, *, win=50_000, hop=25_000):
+    # numbers
+    z,o,r,total = lsb_bias(raw_bytes_u8)
+    chi_all = pov_chi_square(raw_bytes_u8)
+
+    # charts
+    lsb_hist_img = bar2(z, o, title=f"LSB Histogram  (ones={r:.4f})")
+    chi_vals, _  = sliding_stat(raw_bytes_u8, win, hop, pov_chi_square)
+    chi_tl_img   = line_plot(chi_vals, title="Pairs-of-Values χ² (sliding)")
+    bias_vals, _ = sliding_stat(raw_bytes_u8, win, hop, lambda b: (b & 1).mean())
+    bias_tl_img  = line_plot(bias_vals, title="LSB Ones Ratio (sliding)")
+
+    return {
+        "numbers": {"lsb_zeros": z, "lsb_ones": o, "lsb_ratio": r, "total": total, "chi2_all": chi_all},
+        "images":  {"lsb_hist": lsb_hist_img, "chi_timeline": chi_tl_img, "bias_timeline": bias_tl_img}
+    }
+

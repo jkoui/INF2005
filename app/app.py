@@ -2,6 +2,7 @@ import io
 import os
 from typing import Tuple
 import traceback
+from unittest import result
 import numpy as np
 import os as _os
 import subprocess
@@ -43,7 +44,8 @@ from stego.media import (
     make_change_overlay  
 )
 
-from stego.steganalysis import ( chi_square_heatmap, decode_mono, waveform_compare_stacked, audio_embed_map_from_prng, audio_embed_map_from_diff  )
+from stego.steganalysis import ( chi_square_heatmap, decode_mono, waveform_compare_stacked, 
+                                audio_embed_map_from_prng, audio_embed_map_from_diff, wav_stats_and_charts  )
 
 app = Flask(__name__)
 app.secret_key = "acw1-secret"
@@ -802,6 +804,26 @@ def embed_audio():
             "audio_embed_lane_prng": audio_embed_lane_prng,
             "audio_embed_lane_diff": audio_embed_lane_diff,
         }
+
+        cover_stats = wav_stats_and_charts(flat_bytes)
+        stego_stats = wav_stats_and_charts(stego_flat)
+
+        # Convert PIL images to data URLs
+        def to_data_url(img): return img_to_data_url(img)  # you already have this
+
+        result.update({
+            # Numbers (whole file)
+            "cover_lsb_ratio": round(cover_stats["numbers"]["lsb_ratio"], 6),
+            "stego_lsb_ratio": round(stego_stats["numbers"]["lsb_ratio"], 6),
+            "cover_chi2": round(cover_stats["numbers"]["chi2_all"], 2),
+            "stego_chi2": round(stego_stats["numbers"]["chi2_all"], 2),
+
+            # Charts (whole file + sliding)
+            "cover_lsb_hist": to_data_url(cover_stats["images"]["lsb_hist"]),
+            "stego_lsb_hist": to_data_url(stego_stats["images"]["lsb_hist"]),
+            "stego_chi_timeline": to_data_url(stego_stats["images"]["chi_timeline"]),
+            "stego_bias_timeline": to_data_url(stego_stats["images"]["bias_timeline"]),
+        })
         return render_template("index.html", result=result)
 
     except Exception as e:
@@ -905,6 +927,15 @@ def extract_audio():
 
         stego_audio_preview = audio_to_data_url(save_wav_to_bytes(flat_bytes, wav_params))
         result = {"payload_name": fname, "stego_audio_preview": stego_audio_preview,"audio_embed_lane_prng": embed_lane_prng }
+        stego_stats = wav_stats_and_charts(flat_bytes)
+        result.update({
+            "stego_lsb_ratio": round(stego_stats["numbers"]["lsb_ratio"], 6),
+            "stego_chi2": round(stego_stats["numbers"]["chi2_all"], 2),
+            "stego_lsb_hist": img_to_data_url(stego_stats["images"]["lsb_hist"]),
+            "stego_chi_timeline": img_to_data_url(stego_stats["images"]["chi_timeline"]),
+            "stego_bias_timeline": img_to_data_url(stego_stats["images"]["bias_timeline"]),
+        })
+
         return render_template("index.html", result=result)
 
     except Exception as e:
