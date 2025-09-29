@@ -52,6 +52,38 @@ HEADER_KEY_MASK = 0xA5A5A5A5
 def header_key(user_key: int) -> int:
     return int(user_key) ^ HEADER_KEY_MASK
 
+def guess_extension_from_bytes(data: bytes) -> str:
+    """Return a likely file extension starting with dot, or '' if unknown."""
+    # Common magic numbers
+    sigs = [
+        (b"\x89PNG\r\n\x1a\n", ".png"),
+        (b"%PDF-", ".pdf"),
+        (b"\xFF\xD8\xFF", ".jpg"),
+        (b"GIF87a", ".gif"),
+        (b"GIF89a", ".gif"),
+        (b"PK\x03\x04", ".zip"),         # also docx/xlsx/pptx
+        (b"OggS", ".ogg"),
+        (b"\x1A\x45\xDF\xA3", ".mkv"),   # Matroska
+        (b"ID3", ".mp3"),
+        (b"RIFF", ".wav"),               # check 'WAVE' later if you want
+        (b"\x00\x00\x00\x18ftyp", ".mp4"),
+        (b"\x00\x00\x00\x20ftyp", ".mp4"),
+    ]
+    for magic, ext in sigs:
+        if data.startswith(magic):
+            return ext
+
+    # Text heuristic: decodes as UTF-8 and no NUL bytes
+    try:
+        _ = data.decode("utf-8")
+        if b"\x00" not in data:
+            return ".txt"
+    except Exception:
+        pass
+
+    return ""  # unknown → caller can fall back to .bin
+
+
 # ---------- ROI helpers (shared) ----------
 def to_float_opt(s):
     """Return float or None if empty/invalid."""
@@ -252,10 +284,10 @@ def embed():
         required_bytes = header_bytes_len + cipher_bytes_len
 
         # Reserve a top strip for the header so ROI can never overwrite it
-        header_carrier_bytes = (header_bits.size + 7) // 8           # ceil
-        header_carrier_pixels = (header_carrier_bytes + 2) // 3      # ceil
-        header_rows = (header_carrier_pixels + W - 1) // W               # ceil
-        reserved_y2 = min(H, header_rows)                                # strip is rows [0 .. reserved_y2)
+        needed_carrier_bytes = (header_bits.size + n_lsb - 1) // n_lsb  # ceil(bits / n_lsb)
+        header_carrier_pixels = (needed_carrier_bytes + 2) // 3         # 3 bytes per RGB pixel
+        header_rows = (header_carrier_pixels + W - 1) // W
+        reserved_y2 = min(H, header_rows)                             # strip is rows [0 .. reserved_y2)
 
         # Adjust/choose ROI so it does not include the reserved strip.
         if region:
@@ -279,12 +311,44 @@ def embed():
             flash(f"Cover too small. ROI capacity={cap_bytes} bytes, Needed={cipher_bytes_len} bytes")
             return redirect(url_for("index"))
         
-        # ---- Write header into the dedicated top strip only ----
+        # ---- Write header into the dedicated top strip only (ALWAYS 1 LSB) ----
+        # ---- Write header into the dedicated top strip only (ALWAYS 1 LSB) ----
+        n_lsb_header = 1
         flat_mut = flat.copy()
+
+        # Compute final reserved_y2 from the real header size at 1-LSB
+        needed_carrier_bytes = (header_bits.size + n_lsb_header - 1) // n_lsb_header
+        header_carrier_pixels = (needed_carrier_bytes + 2) // 3
+        header_rows = (header_carrier_pixels + W - 1) // W
+        reserved_y2 = min(H, header_rows)
+
+        # Re-apply ROI so it starts below the final header strip
+        if region:
+            x1, y1, x2, y2 = region["x1"], region["y1"], region["x2"], region["y2"]
+            y1 = max(y1, reserved_y2)
+            if y1 >= y2:
+                flash(f"ROI is too small after reserving top {reserved_y2} row(s) for the header.")
+                return redirect(url_for("index"))
+        else:
+            x1, y1, x2, y2 = 0, reserved_y2, W, H
+
+        # Recompute ROI-dependent capacity *after* the final clamp
+        sel_w = x2 - x1
+        sel_h = y2 - y1
+        roi_pixels = sel_w * sel_h
+        cap_bits = roi_pixels * C * n_lsb
+        cap_bytes = cap_bits // 8
+        if cipher_bits.size > cap_bits:
+            flash(f"Cover too small. ROI capacity={cap_bytes} bytes, Needed={cipher_bytes_len} bytes")
+            return redirect(url_for("index"))
+
+        # Now write the header strip
         strip_len_bytes = reserved_y2 * W * C
         strip = flat_mut[:strip_len_bytes].copy()
-        strip_after = embed_bits_into_bytes(strip, header_bits, n_lsb, header_key(key))
+        strip_after = embed_bits_into_bytes(strip, header_bits, n_lsb_header, header_key(key))
         flat_mut[:strip_len_bytes] = strip_after
+
+
 
         # ---- Write ciphertext into ROI only (never touches header strip) ----
         arr = flat_mut.reshape(H, W, C)
@@ -389,12 +453,45 @@ def download_stego():
         return redirect(url_for("index"))
     return send_file(io.BytesIO(_LAST_STEGO), as_attachment=True, download_name="stego.png", mimetype="image/png")
 
+def try_parse_header_from_strip(flat, W, H, key: int):
+    MAX_HDR_BYTES = FIXED_LEN + 255
+    max_hdr_bits  = MAX_HDR_BYTES * 8
+
+    n_lsb_header = 1
+    # rows sized for worst-case header at 1 LSB
+    needed_carrier_bytes = (max_hdr_bits + n_lsb_header - 1) // n_lsb_header
+    max_hdr_pixels = (needed_carrier_bytes + 2) // 3
+    max_hdr_rows   = (max_hdr_pixels + W - 1) // W
+    reserved_y2    = min(H, max_hdr_rows)
+
+    strip_len_bytes = reserved_y2 * W * 3
+    if strip_len_bytes <= 0:
+        raise ValueError("Header strip is empty.")
+
+    strip = flat[:strip_len_bytes]
+    cap_bits_in_strip = strip_len_bytes * n_lsb_header
+    req_bits = min(max_hdr_bits, cap_bits_in_strip)
+
+    all_hdr_bits = extract_bits_from_bytes(strip, n_lsb_header, header_key(key), req_bits)
+
+    bit_cursor = 0
+    def read_bits(nbits: int):
+        nonlocal bit_cursor
+        if bit_cursor + nbits > all_hdr_bits.size:
+            raise ValueError("Header truncated in carrier.")
+        out = all_hdr_bits[bit_cursor: bit_cursor + nbits]
+        bit_cursor += nbits
+        return out
+
+    hdr, header_bits = parse_secure_header(read_bits)
+    return hdr, header_bits, n_lsb_header, reserved_y2
+
 @app.post("/extract")
 def extract():
     global _LAST_PAYLOAD
     try:
         stego = request.files.get("stego")
-        n_lsb = int(request.form.get("lsb", "1"))
+        user_n_lsb = int(request.form.get("lsb", "1"))  # may be wrong
         key = int(request.form.get("key", "0"))
 
         if not stego:
@@ -404,75 +501,72 @@ def extract():
         stego.stream.seek(0)
         flat, shape = load_image_from_file(stego)
         H, W = shape
-        C = 3
 
-        # --- Read header from the dedicated top strip ---
-        # Use a strip big enough to hold the maximum possible header:
-        # FIXED_LEN + up to 255 bytes of filename
-        MAX_HDR_BYTES = FIXED_LEN + 255
-        max_hdr_pixels = (MAX_HDR_BYTES + 2) // 3
-        max_hdr_rows = (max_hdr_pixels + W - 1) // W
-        reserved_y2 = min(H, max_hdr_rows)
-        strip_len_bytes = reserved_y2 * W * C
-        strip = flat[:strip_len_bytes]
+       # --- Robust header recovery (always 1 LSB) ---
+        try:
+            hdr, header_bits, n_lsb_header, reserved_y2 = try_parse_header_from_strip(flat, W, H, key)
+        except Exception as e:
+            flash(f"Extract error: {type(e).__name__}: {e or 'failed to parse header (check key)'}")
+            return redirect(url_for("index"))
 
-        # Stateful reader over the strip only (matches how we embedded it)
-        read_cursor = {"ofs": 0}
-        def read_bits(nbits: int):
-            # slice the unread portion of the strip and advance
-            start = read_cursor["ofs"]
-            # compute how many bytes we need to expose; we can just pass the
-            # remaining strip because extract_bits_from_bytes reads from start
-            remaining = strip[start:]
-            out = extract_bits_from_bytes(remaining, n_lsb, header_key(key), nbits)
-            # advance by however many *carrier* bytes were consumed
-            # carrier bytes used = ceil(nbits / (8 * n_lsb)) per channel-byte
-            used_bytes = (nbits + (n_lsb * 8) - 1) // (n_lsb * 8)
-            read_cursor["ofs"] += used_bytes
-            return out
-
-        # 1) Parse secure header to learn sizes/materials
-        hdr, header_bits = parse_secure_header(read_bits)
-
-        # ROI from header (clamp just in case)
+        # ROI clamped; ensure we start below header strip
         x1 = max(0, min(W, hdr.roi_x1))
-        y1 = max(0, min(H, hdr.roi_y1))
+        y1 = max(reserved_y2, max(0, min(H, hdr.roi_y1)))
         x2 = max(0, min(W, hdr.roi_x2))
         y2 = max(0, min(H, hdr.roi_y2))
         if x2 <= x1 or y2 <= y1:
-            raise ValueError("Invalid ROI stored in header.")
+            flash("Extract error: Invalid/empty ROI after accounting for header strip.")
+            return redirect(url_for("index"))
 
-        # 2) Ciphertext length = plaintext length + 16 (AES-GCM tag)
+        # Use the payload LSBs stored in header for ciphertext extraction
+        n_lsb_payload = int(getattr(hdr, "lsb_used", 1)) or 1
+        if user_n_lsb != n_lsb_payload:
+            flash(f"Extract error: you selected {user_n_lsb} LSBs, but the payload was embedded with {n_lsb_payload} LSBs.")
+            return redirect(url_for("index"))
+
         cipher_len = hdr.plain_len + TAG_LEN
         total_cipher_bits = cipher_len * 8
-
-        arr = flat.reshape(H, W, C)
+        arr = flat.reshape(H, W, 3)
         roi_flat = arr[y1:y2, x1:x2, :].reshape(-1)
-
-        cipher_bits = extract_bits_from_bytes(roi_flat, n_lsb, key, total_cipher_bits)
-        ciphertext_with_tag = bits_to_bytes(cipher_bits)
-
-        # 4) Re-derive key & decrypt
+        cipher_bits = extract_bits_from_bytes(roi_flat, n_lsb_payload, key, total_cipher_bits)
+        ciphertext_with_tag = bits_to_bytes(cipher_bits)   
+        # Decrypt & verify
         key_bytes = derive_key(int(key), hdr.salt)
-        plaintext = decrypt_aes_gcm(key_bytes, hdr.nonce, ciphertext_with_tag, aad=None)
+        try:
+            plaintext = decrypt_aes_gcm(key_bytes, hdr.nonce, ciphertext_with_tag, aad=None)
+        except Exception as e:
+            # This is typically empty-message exception on MAC failure
+            flash("Extract error: Decryption failed (wrong key or corrupted data).")
+            return redirect(url_for("index"))
 
-        # 5) Verify integrity (SHA-256 of plaintext)
         if sha256(plaintext) != hdr.sha256:
-            raise ValueError("Integrity check failed (SHA-256 mismatch). Wrong key or corrupted data.")
+            flash("Extract error: Integrity check failed (SHA-256 mismatch).")
+            return redirect(url_for("index"))
 
-        # 6) Save using original filename from header
-        fname = secure_filename(hdr.name or "recovered.bin")
-        if not os.path.splitext(fname)[1]:
-            fname += ".bin"
+        # Save output
+        fname = secure_filename(hdr.name or "")  # allow empty here
+        ext = os.path.splitext(fname)[1]
+        if not ext:
+            # Guess from content; if still unknown, fall back to .bin
+            ext = guess_extension_from_bytes(plaintext) or ".bin"
+            base = fname if fname else "recovered"
+            fname = f"{base}{ext}"
+
         _LAST_PAYLOAD = (plaintext, fname)
 
-        stego_img = Image.fromarray(flat.reshape(shape[0], shape[1], 3).astype("uint8"), mode="RGB")
+        stego_img = Image.fromarray(flat.reshape(H, W, 3).astype("uint8"))
         stego_preview = img_to_data_url(stego_img)
-        result = {"payload_name": fname, "stego_preview": stego_preview}
+        result = {
+            "payload_name": fname,
+            "stego_preview": stego_preview,
+            "note": f"Header LSB: 1; Payload LSB (from header): {n_lsb_payload} (you selected {user_n_lsb})"
+        }
         return render_template("index.html", result=result)
 
     except Exception as e:
-        flash(f"Extract error: {e}")
+        import traceback
+        print("EXTRACT ERROR TRACEBACK:\n", traceback.format_exc())
+        flash(f"Extract error: {type(e).__name__}: {e or 'unknown'}")
         return redirect(url_for("index"))
 
 # -------- Audio WAV routes --------
