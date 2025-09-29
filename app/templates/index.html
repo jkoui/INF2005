@@ -384,10 +384,25 @@
         <div class="card preview">
           <h3>Waveform (Zoomed)</h3>
           <img class="wave" src="{{ result.waveform_zoom_preview }}" alt="Waveform zoom">
-          <p class="muted">Zoomed window; uses your ROI time range if provided.</p>
+          <p class="muted">Zoomed window; uses ROI time range if provided.</p>
         </div>
       {% endif %}
 
+      {% if result.audio_embed_lane_prng %}
+        <div class="card preview">
+          <h3>Embedding Map (Audio · PRNG Plan)</h3>
+          <img class="wave" src="{{ result.audio_embed_lane_prng }}" alt="Embedding density (PRNG)">
+          <p class="muted">Darker bars = more writes per time slice.</p>
+        </div>
+      {% endif %}
+
+      {% if result.audio_embed_lane_diff %}
+        <div class="card preview">
+          <h3>Embedding Map (Audio · From Diff)</h3>
+          <img class="wave" src="{{ result.audio_embed_lane_diff }}" alt="Embedding density (Diff)">
+          <p class="muted">Computed from cover vs stego differences; darker = more changed bytes.</p>
+        </div>
+      {% endif %}
 
       {% if result.capacity %}
         <div class="card" style="min-width:320px;">

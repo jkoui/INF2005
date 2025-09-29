@@ -43,7 +43,7 @@ from stego.media import (
     make_change_overlay  
 )
 
-from stego.steganalysis import ( chi_square_heatmap, decode_mono, waveform_compare_stacked  )
+from stego.steganalysis import ( chi_square_heatmap, decode_mono, waveform_compare_stacked, audio_embed_map_from_prng, audio_embed_map_from_diff  )
 
 app = Flask(__name__)
 app.secret_key = "acw1-secret"
@@ -687,6 +687,32 @@ def embed_audio():
         slice_stego = embed_bits_into_bytes(slice_cover, data_bits, n_lsb, key)
         stego_flat[embed_start:embed_end] = slice_stego
 
+        # --- Embedding map (PRNG plan) ---
+        num_bits = int(data_bits.size)
+        embed_lane_prng = audio_embed_map_from_prng(
+            total_bytes=flat_bytes.size,
+            framerate=fr,
+            frame_bytes=frame_size,
+            embed_start=embed_start,
+            embed_end=embed_end,
+            n_lsb=n_lsb,
+            num_bits=num_bits,
+            key=key,
+            width=1100, lane_h=80
+        )
+        audio_embed_lane_prng = img_to_data_url(embed_lane_prng)
+
+        # --- Embedding map (from diff) ---
+        embed_lane_diff = audio_embed_map_from_diff(
+            cover_bytes=flat_bytes,
+            stego_bytes=stego_flat,
+            framerate=fr,
+            frame_bytes=frame_size,
+            width=1100, lane_h=80
+        )
+        audio_embed_lane_diff = img_to_data_url(embed_lane_diff)
+
+
         # --- Immediately read back from the same slice using PRNG (must start with '41435731' = 'ACW1')
         test_slice = stego_flat[embed_start:embed_end]
         perm_len   = test_slice.size * n_lsb
@@ -773,6 +799,8 @@ def embed_audio():
             "download_wav_url": url_for("download_stego_wav"),
             "waveform_full_preview": waveform_full_preview,
             "waveform_zoom_preview": waveform_zoom_preview,
+            "audio_embed_lane_prng": audio_embed_lane_prng,
+            "audio_embed_lane_diff": audio_embed_lane_diff,
         }
         return render_template("index.html", result=result)
 
@@ -840,6 +868,23 @@ def extract_audio():
         cipher_len = hdr.plain_len + TAG_LEN
         total_bits = header_bits + cipher_len * 8
 
+        # --- Embedding map (PRNG plan) during extraction ---
+        num_bits = int(total_bits)
+        embed_lane_prng = audio_embed_map_from_prng(
+            total_bytes=flat_bytes.size,
+            framerate=wav_params["framerate"],
+            frame_bytes=wav_params["sampwidth"] * wav_params["nchannels"],
+            embed_start=embed_start,
+            embed_end=embed_end,
+            n_lsb=n_lsb,
+            num_bits=num_bits,
+            key=key,
+            width=1100, lane_h=80
+        )
+        embed_lane_prng = img_to_data_url(embed_lane_prng)
+
+        
+
         # 3) Extract header+ciphertext from the slice, then split
         all_bits = extract_bits_from_bytes(slice_bytes, n_lsb, key, total_bits)
         all_bytes = bits_to_bytes(all_bits)
@@ -859,7 +904,7 @@ def extract_audio():
         _LAST_PAYLOAD = (plaintext, fname)
 
         stego_audio_preview = audio_to_data_url(save_wav_to_bytes(flat_bytes, wav_params))
-        result = {"payload_name": fname, "stego_audio_preview": stego_audio_preview}
+        result = {"payload_name": fname, "stego_audio_preview": stego_audio_preview,"audio_embed_lane_prng": embed_lane_prng }
         return render_template("index.html", result=result)
 
     except Exception as e:

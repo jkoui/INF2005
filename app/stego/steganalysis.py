@@ -241,3 +241,103 @@ def waveform_compare_stacked(
 
     return img
 
+# --- Embedding map (audio) from PRNG plan ---
+def audio_embed_map_from_prng(
+    total_bytes: int,
+    framerate: int,
+    frame_bytes: int,          # bytes per audio frame (nchannels * sampwidth)
+    *,
+    embed_start: int,
+    embed_end: int,
+    n_lsb: int,
+    num_bits: int,             # total embedded bits (header + ciphertext)
+    key: int,
+    width: int = 1100,
+    lane_h: int = 80,
+    bg=(255,255,255),
+    color=(30,160,60)          # green
+) -> Image.Image:
+    from stego.core import prng_perm  # your deterministic version
+
+    slice_len = max(0, embed_end - embed_start)
+    if slice_len <= 0 or n_lsb <= 0:
+        return Image.new("RGB", (width, lane_h), bg)
+
+    total_slots = slice_len * n_lsb
+    bits = min(int(num_bits), total_slots)
+
+    perm = prng_perm(total_slots, key)[:bits]
+    byte_idx = perm // n_lsb                         # 0..slice_len-1
+    touched = np.bincount(byte_idx, minlength=slice_len).astype(np.float32)
+
+    byte_rate = framerate * frame_bytes
+    t0 = embed_start / max(1, byte_rate)
+    t1 = embed_end   / max(1, byte_rate)
+    dur = max(1e-9, t1 - t0)
+
+    cols = np.zeros(width, dtype=np.float32)
+    # map each byte to a time column
+    for b, c in enumerate(touched):
+        tb = (embed_start + b) / byte_rate
+        x  = int((tb - t0) / dur * (width - 1))
+        if 0 <= x < width:
+            cols[x] += c
+
+    # light smoothing
+    if width > 5:
+        k = np.array([1,2,3,2,1], dtype=np.float32); k /= k.sum()
+        cols = np.convolve(cols, k, mode="same")
+
+    if cols.max() > 0: cols /= cols.max()
+
+    H = lane_h
+    img = Image.new("RGB", (width, H), bg)
+    drw = ImageDraw.Draw(img)
+    for x in range(width):
+        h = int(cols[x] * (H - 4))
+        if h > 0:
+            drw.line((x, H-2, x, H-2-h), fill=color, width=1)
+    drw.text((6, 6), "Embedding density (PRNG)", fill=(0,0,0))
+    return img
+
+
+# --- Embedding map (audio) from cover vs stego diff ---
+def audio_embed_map_from_diff(
+    cover_bytes: np.ndarray,
+    stego_bytes: np.ndarray,
+    framerate: int,
+    frame_bytes: int,
+    *,
+    width: int = 1100,
+    lane_h: int = 80,
+    bg=(255,255,255),
+    color=(50,90,220)          # blue
+) -> Image.Image:
+    N = min(cover_bytes.size, stego_bytes.size)
+    if N <= 0:
+        return Image.new("RGB", (width, lane_h), bg)
+
+    changed = ((cover_bytes[:N] ^ stego_bytes[:N]) & 0xFF) != 0
+    byte_rate = framerate * frame_bytes
+    dur = N / max(1, byte_rate)
+
+    cols = np.zeros(width, dtype=np.float32)
+    for b in range(N):
+        if not changed[b]: continue
+        tb = b / byte_rate
+        x  = int(tb / max(1e-9, dur) * (width - 1))
+        if 0 <= x < width:
+            cols[x] += 1.0
+
+    if cols.max() > 0: cols /= cols.max()
+
+    H = lane_h
+    img = Image.new("RGB", (width, H), bg)
+    drw = ImageDraw.Draw(img)
+    for x in range(width):
+        h = int(cols[x] * (H - 4))
+        if h > 0:
+            drw.line((x, H-2, x, H-2-h), fill=color, width=1)
+    drw.text((6, 6), "Embedding density (diff)", fill=(0,0,0))
+    return img
+
